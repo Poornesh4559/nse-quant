@@ -36,7 +36,7 @@ def cmd_login(_args) -> int:
     client = FyersClient()
     token = client.get_access_token(force=True)
     print(f"access_token obtained and cached to {settings.token_cache_path}")
-    print(token)
+    print(f"token starts with: {token[:6]}... (full token kept out of logs)")
     return 0
 
 

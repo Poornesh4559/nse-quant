@@ -67,11 +67,12 @@ class FyersClient:
         """Run an SDK call with throttling, 429 backoff, and re-auth on token expiry.
 
         The SDK signals errors either by raising or by returning
-        {'s': 'error', 'code': ...}; both paths are handled.
+        {'s': 'error', 'code': ...}; both paths are handled. On auth errors the
+        token is cleared and the call is retried once with a fresh token.
         """
-        attempts = 2
-        for attempt in range(attempts):
+        for attempt in range(2):
             result = None
+            reauth = False
             for retry in range(RATE_LIMIT_MAX_RETRIES):
                 self._throttle()
                 result = fn(**kwargs)
@@ -85,7 +86,10 @@ class FyersClient:
                         logger.warning("auth error in response (%s); refreshing token", result)
                         self._clear_token()
                         self.reset_model()
+                        reauth = True
                         break
+                return result
+            if not reauth:
                 return result
         return result
 
