@@ -79,7 +79,7 @@ nse-quant/
 
 | Phase | What | Status |
 |---|---|---|
-| **1** | Data collector: EOD OHLC → TimescaleDB, daily + intraday cron | 🔜 next |
+| **1** | Data collector: EOD OHLC → TimescaleDB, daily + intraday cron | 🟡 infra done (compose + schema) — collector in progress |
 | **2** | Dashboard: candles, movers, sentiment on subdomain | ⏳ |
 | **3** | News + sentiment pipeline (RSS → VADER → LLM summary) | 🟢 prototype done |
 | **4** | Backtesting + signal research (pandas/vectorbt/ML) | ⏳ |

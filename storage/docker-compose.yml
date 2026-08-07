@@ -1,0 +1,22 @@
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    container_name: nse-timescaledb
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5432:5432"   # localhost only — never expose publicly
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-nse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      POSTGRES_DB: ${POSTGRES_DB:-nse_quant}
+    volumes:
+      - timescale-data:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro   # schema applied on first boot
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nse} -d ${POSTGRES_DB:-nse_quant}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  timescale-data:
