@@ -54,20 +54,20 @@ Build a production-grade personal pipeline for NSE data:
 ```
 nse-quant/
 ├── collector/          # data collection scripts (Fyers + Yahoo + news)
-│   ├── fyers_client.py
-│   ├── yahoo_eod.py
-│   ├── news_sentiment.py     # VADER pipeline (prototype exists)
-│   └── scheduler.py          # cron entrypoints
+│   ├── fyers_client.py      # auth + token cache + history/quotes wrapper
+│   ├── auth.py              # headless login via vagator v2 HTTP flow (TOTP+PIN → token)
+│   ├── symbols.py           # NIFTY 50 + indices seed (NSE API + fallback)
+│   ├── backfill.py          # EOD + intraday historical backfill (chunked)
+│   ├── intraday.py          # 5-min polling of 5m/15m candles
+│   ├── eod.py               # post-close daily candle update
+│   ├── scheduler.py         # CLI entrypoints for cron
+│   ├── config.py            # .env loading (single source of truth)
+│   └── db.py                # psycopg2 upserts for symbols/candles
 ├── storage/            # DB schema, migrations, TimescaleDB setup
-│   ├── schema.sql
+│   ├── init/01_schema.sql
 │   └── docker-compose.yml    # timescaledb service
 ├── analysis/           # indicators, backtests, signals, ML
-│   ├── indicators.py
-│   ├── backtest.py
-│   └── signals/
 ├── dashboard/          # Cloudflare Pages app + Worker API
-│   ├── pages/          # static frontend
-│   └── worker/         # JSON API (routes to tunnel → TimescaleDB)
 ├── bot/                # paper trading engine (Fyers)
 ├── scripts/            # one-off utilities
 ├── tests/
@@ -79,11 +79,29 @@ nse-quant/
 
 | Phase | What | Status |
 |---|---|---|
-| **1** | Data collector: EOD OHLC → TimescaleDB, daily + intraday cron | 🟡 infra done (compose + schema) — collector in progress |
+| **1** | Data collector: EOD OHLC → TimescaleDB, daily + intraday cron | 🟢 collector live — backfilled 52 symbols (115k rows); cron setup pending |
 | **2** | Dashboard: candles, movers, sentiment on subdomain | ⏳ |
 | **3** | News + sentiment pipeline (RSS → VADER → LLM summary) | 🟢 prototype done |
 | **4** | Backtesting + signal research (pandas/vectorbt/ML) | ⏳ |
 | **5** | Paper trading bot on Fyers (simulated first) | ⏳ |
+
+## ⏰ Scheduled Jobs (for Hermes / cron)
+
+All collector commands run from the repo root with the project venv. Server TZ is
+**Asia/Kolkata (IST)**; Hermes cron schedules evaluate in **UTC** (IST - 5:30).
+
+| Job | Schedule (IST) | Command |
+|---|---|---|
+| Intraday 5m/15m poll | every 5 min, Mon–Fri 09:15–15:35 | `.venv/bin/python -m collector.scheduler intraday` |
+| EOD daily candles | daily 18:00 | `.venv/bin/python -m collector.scheduler eod` |
+| Token safety refresh | daily 09:00 (before market) | `.venv/bin/python -m collector.scheduler login` |
+
+Notes:
+- `intraday`/`eod` auto-refresh the token if expired (headless vagator login);
+  the 09:00 job pre-warms it so market-hours runs never stall.
+- Only run `intraday` when the market is open — skip weekends/holidays.
+- Logs: the SDK writes `data/fyersApi.log` + `data/fyersRequests.log` (gitignored).
+- Token cache: `data/fyers_token.json` (gitignored), ~23h validity before refresh.
 
 ## 🔐 Security Notes
 
@@ -104,15 +122,28 @@ This is a **learning project**. Nothing here is financial advice. Trading involv
 # requirements
 # - Docker + Docker Compose on the VPS (already present)
 # - Fyers API creds (user's account)
-# - Python 3.11 venv
+# - Python 3.11 venv (use ~/.local/bin/python3.11; system pip is PEP-668 locked)
 
 git clone https://github.com/poornesh4559/nse-quant.git
 cd nse-quant
 cp .env.example .env   # fill in Fyers keys
 docker compose -f storage/docker-compose.yml up -d
-python -m venv .venv && .venv/bin/pip install -r requirements.txt
-# ... (to be documented per phase)
+/home/ubuntu/.local/bin/python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+# seed the symbol universe (NIFTY 50 + indices)
+.venv/bin/python -m collector.scheduler seed
+# force a fresh token (headless vagator login; needs FYERS_ID/TOTP/PIN/APP_* in .env)
+.venv/bin/python -m collector.scheduler login
+# backfill history (EOD + 5m/15m), test run on 3 symbols first
+.venv/bin/python -m collector.scheduler backfill --days 90 --timeframes 1d 5m 15m --limit 3
+.venv/bin/python -m collector.scheduler backfill --days 90 --timeframes 1d 5m 15m
+# daily: EOD after ~18:00 IST, intraday every 5 min during market hours
 ```
+
+**Fyers auth notes:** the 1-day access token has no refresh token. The collector
+re-authenticates automatically via the vagator v2 HTTP flow (TOTP + PIN) when the
+token expires, and caches it in `data/fyers_token.json`. All creds live in `.env`
+(`FYERS_APP_ID`/`FYERS_APP_TYPE`/`FYERS_APP_SECRET`, `FYERS_ID`, `FYERS_TOTP_KEY`, `FYERS_PIN`).
 
 ---
 
