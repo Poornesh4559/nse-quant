@@ -1,0 +1,27 @@
+# Secrets — NEVER commit these
+.env
+*.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Data & artifacts
+*.parquet
+*.csv
+data/
+backtests/
+logs/
+
+# Editor/OS
+.vscode/
+.idea/
+.DS_Store
+
+# Credentials from any source
+*key*.pem
+*credential*
