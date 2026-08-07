@@ -3,6 +3,11 @@
 *.env
 .env.local
 
+# Local agent context files (repo is public — keep these local)
+AGENTS.md
+CLAUDE.md
+.cursorrules
+
 # Python
 __pycache__/
 *.py[cod]
