@@ -174,7 +174,7 @@ class FyersClient:
         """Detect auth-related error responses from the Fyers API."""
         code = str(resp.get("code", ""))
         message = str(resp.get("message", "")).lower()
-        if code in {"401", "-5", "1100", "1101"}:
+        if code in {"401", "-5", "-16", "1100", "1101"}:
             return True
         return any(m in message for m in ("unauthorised", "unauthorized", "invalid token", "token expired", "not a valid access token"))
 

@@ -21,7 +21,7 @@
   </header>
 
   <main class="layout">
-    <!-- Main chart panel -->
+    <!-- Main chart + indicator sub-panels -->
     <section class="panel chart-panel">
       <div class="controls">
         <div class="controls-left">
@@ -34,29 +34,75 @@
             <button type="button" class="tf-btn" data-tf="15m">15M</button>
             <button type="button" class="tf-btn" data-tf="5m">5M</button>
           </div>
+          <div class="ind-chips" role="group" aria-label="Indicator overlays">
+            <button type="button" class="ind-chip active" data-ind="sma20" title="20-period simple moving average"><span class="dot"></span>SMA 20</button>
+            <button type="button" class="ind-chip active" data-ind="sma50" title="50-period simple moving average"><span class="dot"></span>SMA 50</button>
+            <button type="button" class="ind-chip" data-ind="ema" title="EMA 12 / EMA 26"><span class="dot"></span>EMA 12/26</button>
+            <button type="button" class="ind-chip" data-ind="bb" title="Bollinger bands (20, 2σ)"><span class="dot"></span>BB</button>
+          </div>
         </div>
-        <div id="chart-title" class="chart-title">—</div>
+        <div class="chart-title-wrap">
+          <div id="chart-title" class="chart-title">—</div>
+          <div id="chart-range" class="chart-range">—</div>
+        </div>
       </div>
-      <div class="chart-wrap">
-        <canvas id="candle-chart"></canvas>
+
+      <div class="chart-body">
+        <div class="chart-wrap">
+          <canvas id="candle-chart"></canvas>
+        </div>
+        <div class="sub-panels">
+          <div class="sub-panel">
+            <div class="sub-panel-head"><span class="sub-title">Volume</span></div>
+            <div class="sub-wrap"><canvas id="volume-chart"></canvas></div>
+          </div>
+          <div class="sub-panel">
+            <div class="sub-panel-head"><span class="sub-title">RSI (14)</span></div>
+            <div class="sub-wrap"><canvas id="rsi-chart"></canvas></div>
+          </div>
+          <div class="sub-panel">
+            <div class="sub-panel-head"><span class="sub-title">MACD (12, 26, 9)</span></div>
+            <div class="sub-wrap"><canvas id="macd-chart"></canvas></div>
+          </div>
+        </div>
       </div>
     </section>
 
-    <!-- Movers sidebar -->
-    <aside class="panel movers">
-      <h2>Movers</h2>
-      <div class="movers-section">
-        <h3 class="gainers-title">▲ Gainers</h3>
-        <ul id="gainers-list" class="movers-list">
-          <li class="mover-empty">Loading…</li>
-        </ul>
-      </div>
-      <div class="movers-section">
-        <h3 class="losers-title">▼ Losers</h3>
-        <ul id="losers-list" class="movers-list">
-          <li class="mover-empty">Loading…</li>
-        </ul>
-      </div>
+    <!-- Sidebar: movers + portfolio + sentiment -->
+    <aside class="sidebar">
+      <section class="panel card">
+        <h2>Movers</h2>
+        <div class="movers-section">
+          <h3 class="gainers-title">▲ Gainers</h3>
+          <ul id="gainers-list" class="movers-list"><li class="mover-empty">Loading…</li></ul>
+        </div>
+        <div class="movers-section">
+          <h3 class="losers-title">▼ Losers</h3>
+          <ul id="losers-list" class="movers-list"><li class="mover-empty">Loading…</li></ul>
+        </div>
+      </section>
+
+      <section class="panel card">
+        <h2>Portfolio</h2>
+        <div id="portfolio-body" class="card-body">
+          <div class="empty-state">
+            <div class="icon">💼</div>
+            <div class="title">Bot trading lands in Phase 5</div>
+            <div class="hint">Paper-trade stats will appear here once the trading bot goes live.</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel card">
+        <h2>Sentiment <span id="sentiment-symbol" class="card-sub"></span></h2>
+        <div id="sentiment-body" class="card-body">
+          <div class="empty-state">
+            <div class="icon">📰</div>
+            <div class="title">News sentiment lands in Phase 3</div>
+            <div class="hint">Scored headlines for the selected symbol will show here.</div>
+          </div>
+        </div>
+      </section>
     </aside>
   </main>
 

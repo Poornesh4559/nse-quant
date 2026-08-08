@@ -32,6 +32,7 @@ CREATE INDEX IF NOT EXISTS idx_candles_lookup ON candles (symbol, timeframe, ts 
 CREATE TABLE IF NOT EXISTS news_sentiment (
     id                 BIGSERIAL PRIMARY KEY,
     source             TEXT,
+    symbol             TEXT,                      -- ticker this news maps to (NULL = market-wide)
     title              TEXT NOT NULL,
     url                TEXT,
     published_at       TIMESTAMPTZ,
