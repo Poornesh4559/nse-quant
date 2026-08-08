@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NSE Quant — Dashboard</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="logo">📈</span>
+      <span>NSE Quant</span>
+      <small>NIFTY market dashboard</small>
+    </div>
+    <div class="header-meta">
+      <span id="market-chip" class="chip"><span class="dot"></span>…</span>
+      <span id="candles-total">— candles</span>
+      <span id="last-updated">—</span>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- Main chart panel -->
+    <section class="panel chart-panel">
+      <div class="controls">
+        <div class="controls-left">
+          <label for="symbol-select" class="sr-only">Symbol</label>
+          <select id="symbol-select" title="Symbol">
+            <option value="">Loading symbols…</option>
+          </select>
+          <div class="tf-group" role="group" aria-label="Timeframe">
+            <button type="button" class="tf-btn active" data-tf="1d">1D</button>
+            <button type="button" class="tf-btn" data-tf="15m">15M</button>
+            <button type="button" class="tf-btn" data-tf="5m">5M</button>
+          </div>
+        </div>
+        <div id="chart-title" class="chart-title">—</div>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="candle-chart"></canvas>
+      </div>
+    </section>
+
+    <!-- Movers sidebar -->
+    <aside class="panel movers">
+      <h2>Movers</h2>
+      <div class="movers-section">
+        <h3 class="gainers-title">▲ Gainers</h3>
+        <ul id="gainers-list" class="movers-list">
+          <li class="mover-empty">Loading…</li>
+        </ul>
+      </div>
+      <div class="movers-section">
+        <h3 class="losers-title">▼ Losers</h3>
+        <ul id="losers-list" class="movers-list">
+          <li class="mover-empty">Loading…</li>
+        </ul>
+      </div>
+    </aside>
+  </main>
+
+  <footer>NSE Quant · data via Fyers API · candles in IST</footer>
+
+  <div id="status-msg" role="status" aria-live="polite"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-chart-financial@0.2.1/dist/chartjs-chart-financial.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/luxon@3.4.4/build/global/luxon.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon@1.3.1/dist/chartjs-adapter-luxon.umd.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
