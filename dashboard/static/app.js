@@ -154,23 +154,42 @@ function mkEl(tag, className, text) {
   return e;
 }
 
-function fmtTs(ts) {
+// chartjs-chart-financial sets parsing:false on the whole chart, so every
+// dataset x must be a numeric epoch-ms timestamp — ISO strings leave the
+// candlestick elements unparsed and the main chart renders empty.
+function toMs(ts) {
+  if (typeof ts === 'number') { return ts; }
   if (window.luxon && luxon.DateTime) {
     var dt = luxon.DateTime.fromISO(ts);
-    if (dt.isValid) { return dt.toFormat('dd MMM yyyy HH:mm'); }
+    if (dt.isValid) { return dt.toMillis(); }
+  }
+  return new Date(ts).getTime();
+}
+
+function toDateTime(ts) {
+  if (window.luxon && luxon.DateTime) {
+    var dt = typeof ts === 'number'
+      ? luxon.DateTime.fromMillis(ts)
+      : luxon.DateTime.fromISO(ts);
+    if (dt.isValid) { return dt; }
+    return null;
   }
   var d = new Date(ts);
-  return isNaN(d.getTime()) ? String(ts) : d.toLocaleString('en-IN');
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function fmtTs(ts) {
+  var dt = toDateTime(ts);
+  if (!dt) { return String(ts); }
+  return dt.toFormat ? dt.toFormat('dd MMM yyyy HH:mm') : dt.toLocaleString('en-IN');
 }
 
 function fmtDay(ts) {
-  if (window.luxon && luxon.DateTime) {
-    var dt = luxon.DateTime.fromISO(ts);
-    if (dt.isValid) { return dt.toFormat('MMM d'); }
-  }
-  var d = new Date(ts);
-  if (isNaN(d.getTime())) { return String(ts); }
-  return d.toLocaleDateString('en-IN', { month: 'short', day: 'numeric' });
+  var dt = toDateTime(ts);
+  if (!dt) { return String(ts); }
+  return dt.toFormat
+    ? dt.toFormat('MMM d')
+    : dt.toLocaleDateString('en-IN', { month: 'short', day: 'numeric' });
 }
 
 function fmtRange(a, b) {
@@ -430,7 +449,7 @@ function renderAll(data, withIndicators) {
 
   currentItems = candles.map(function (c) {
     var it = {
-      x: c.ts,
+      x: toMs(c.ts),
       o: Number(c.open), h: Number(c.high),
       l: Number(c.low), c: Number(c.close),
       v: Number(c.volume) || 0

@@ -296,8 +296,8 @@ header {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px 12px;
-  padding: 8px 16px;
+  gap: 10px 12px;
+  padding: 10px 16px;
   border-bottom: 1px solid var(--border);
 }
 
@@ -392,7 +392,7 @@ input[type="date"]::-webkit-calendar-picker-indicator {
 
 /* Chart body: main candles + stacked sub-panels */
 .chart-body {
-  padding: 10px 16px 14px;
+  padding: 12px 16px 16px;
 }
 
 .chart-wrap {
@@ -408,13 +408,13 @@ input[type="date"]::-webkit-calendar-picker-indicator {
 .sub-panels {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  margin-top: 8px;
+  gap: 10px;
+  margin-top: 10px;
 }
 
 .sub-panel {
   border-top: 1px solid var(--border);
-  padding-top: 6px;
+  padding-top: 8px;
 }
 
 .sub-panel-head {
@@ -679,11 +679,22 @@ footer {
 /* ---------- Responsive ---------- */
 
 @media (max-width: 899px) {
-  .layout { grid-template-columns: 1fr; }
+  .layout { grid-template-columns: 1fr; gap: 10px; padding: 10px; }
   .chart-panel { order: 1; }
-  .sidebar { order: 2; }
+  .sidebar { order: 2; gap: 10px; }
   .chart-wrap { height: 330px; }
   .sub-wrap { height: 88px; }
-  header { padding: 12px 16px; }
+  header { padding: 12px 16px; gap: 10px 12px; }
   .chart-title-wrap { align-items: flex-start; text-align: left; }
+
+  /* Tap-friendly controls (>= ~34px touch targets) */
+  .controls { padding: 12px; gap: 10px 12px; }
+  .range-controls { padding: 10px 12px; gap: 10px; }
+  .chart-body { padding: 10px 12px 14px; }
+  .tf-btn { padding: 8px 14px; }
+  .preset-btn { padding: 8px 13px; }
+  .ind-chip { padding: 7px 12px; }
+  .apply-btn { padding: 8px 16px; }
+  input[type="date"] { padding: 8px 10px; min-height: 36px; }
+  #symbol-select { padding: 9px 34px 9px 12px; min-height: 38px; }
 }

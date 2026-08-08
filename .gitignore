@@ -8,6 +8,9 @@ AGENTS.md
 CLAUDE.md
 .cursorrules
 
+# Agent scratch space (opencode/hermes test scripts, screenshots, server logs)
+.work/
+
 # Python
 __pycache__/
 *.py[cod]
