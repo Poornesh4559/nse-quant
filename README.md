@@ -79,8 +79,8 @@ nse-quant/
 
 | Phase | What | Status |
 |---|---|---|
-| **1** | Data collector: EOD OHLC → TimescaleDB, daily + intraday cron | 🟢 collector live — backfilled 52 symbols (115k rows); cron setup pending |
-| **2** | Dashboard: candles, movers, sentiment on subdomain | ⏳ |
+| **1** | Data collector: EOD OHLC → TimescaleDB, daily + intraday cron | ✅ LIVE — cron runs Mon-Fri (intraday 5-min, EOD 18:00 IST, token refresh 8:00 IST) |
+| **2** | Dashboard: candles, movers, market status | ✅ LIVE — **https://stock.poornesh.dev** (FastAPI + Chart.js via tunnel) |
 | **3** | News + sentiment pipeline (RSS → VADER → LLM summary) | 🟢 prototype done |
 | **4** | Backtesting + signal research (pandas/vectorbt/ML) | ⏳ |
 | **5** | Paper trading bot on Fyers (simulated first) | ⏳ |
