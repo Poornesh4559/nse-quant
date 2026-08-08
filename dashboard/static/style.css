@@ -122,12 +122,15 @@ header {
 
 .layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 340px;
-  gap: 16px;
-  padding: 16px;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 12px;
+  padding: 12px;
   max-width: 1680px;
   margin: 0 auto;
+  align-items: start;
 }
+
+.layout > * { min-width: 0; }
 
 .panel {
   background: var(--panel);
@@ -287,14 +290,114 @@ header {
   opacity: 0.85;
 }
 
+/* ---------- Date range controls ---------- */
+
+.range-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.range-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.preset-group {
+  display: flex;
+  gap: 3px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 3px;
+}
+
+.preset-btn {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 4px 11px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.preset-btn:hover { color: var(--text); }
+
+.preset-btn.active {
+  background: rgba(63, 185, 80, 0.15);
+  color: var(--green);
+}
+
+.range-divider {
+  width: 1px;
+  height: 18px;
+  background: var(--border-strong);
+  flex: none;
+}
+
+input[type="date"] {
+  appearance: none;
+  -webkit-appearance: none;
+  background-color: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-family: inherit;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color-scheme: dark;
+}
+
+input[type="date"]:focus {
+  outline: none;
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.15);
+}
+
+input[type="date"]::-webkit-calendar-picker-indicator {
+  cursor: pointer;
+  opacity: 0.7;
+}
+
+.apply-btn {
+  border: 1px solid var(--border-strong);
+  background: var(--bg);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 6px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.apply-btn:hover {
+  border-color: rgba(88, 166, 255, 0.55);
+  color: var(--blue);
+  background: rgba(88, 166, 255, 0.08);
+}
+
 /* Chart body: main candles + stacked sub-panels */
 .chart-body {
-  padding: 10px 6px 8px;
+  padding: 10px 16px 14px;
 }
 
 .chart-wrap {
   position: relative;
-  height: 400px;
+  height: 420px;
 }
 
 #candle-chart {
@@ -305,20 +408,20 @@ header {
 .sub-panels {
   display: flex;
   flex-direction: column;
+  gap: 8px;
   margin-top: 8px;
 }
 
 .sub-panel {
   border-top: 1px solid var(--border);
-  padding-top: 4px;
-  margin-top: 6px;
+  padding-top: 6px;
 }
 
 .sub-panel-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 8px 3px;
+  padding: 0 2px 4px;
 }
 
 .sub-title {
@@ -331,7 +434,7 @@ header {
 
 .sub-wrap {
   position: relative;
-  height: 92px;
+  height: 110px;
 }
 
 #volume-chart, #rsi-chart, #macd-chart {
@@ -344,7 +447,7 @@ header {
 .sidebar {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 12px;
 }
 
 .sidebar h2 {
@@ -575,16 +678,12 @@ footer {
 
 /* ---------- Responsive ---------- */
 
-@media (max-width: 1100px) {
-  .layout { grid-template-columns: minmax(0, 1fr) 300px; }
-}
-
 @media (max-width: 899px) {
   .layout { grid-template-columns: 1fr; }
   .chart-panel { order: 1; }
   .sidebar { order: 2; }
   .chart-wrap { height: 330px; }
-  .sub-wrap { height: 84px; }
+  .sub-wrap { height: 88px; }
   header { padding: 12px 16px; }
   .chart-title-wrap { align-items: flex-start; text-align: left; }
 }

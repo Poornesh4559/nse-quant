@@ -131,14 +131,35 @@ def _latest_1d(order: str, limit: int | None = None) -> list[dict[str, Any]]:
     return rows
 
 
+def _parse_date(value: str | None, end_of_day: bool = False) -> datetime | None:
+    """Parse a YYYY-MM-DD query param into an IST-aware datetime.
+
+    ``end_of_day=True`` pins the time to 23:59:59 IST (inclusive range end).
+    Returns None when the value is missing; raises 400 on malformed input.
+    """
+    if value is None:
+        return None
+    try:
+        d = datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"invalid date '{value}', expected YYYY-MM-DD")
+    if end_of_day:
+        return datetime.combine(d, dtime(23, 59, 59), tzinfo=IST)
+    return datetime.combine(d, dtime(0, 0, 0), tzinfo=IST)
+
+
 def _fetch_candle_rows(
-    symbol: str, timeframe: str, days: int | None, limit: int
+    symbol: str,
+    timeframe: str,
+    days: int | None,
+    limit: int,
+    from_dt: datetime | None = None,
+    to_dt: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Validate symbol/timeframe and fetch OHLCV rows ordered ts ASC.
 
-    ``days`` (when given, wins over ``limit``) fetches every candle with
-    ts >= now_IST - days; otherwise the newest ``limit`` candles are returned
-    (existing behaviour). Raises 404 for an unknown symbol and 400 for an
+    Precedence: explicit ``from_dt``/``to_dt`` (either one) wins over ``days``,
+    which wins over ``limit``. Raises 404 for an unknown symbol and 400 for an
     invalid timeframe. Returns raw rows with ts as tz-aware datetime.
     """
     if timeframe not in VALID_TIMEFRAMES:
@@ -151,7 +172,21 @@ def _fetch_candle_rows(
             cur.execute("SELECT 1 FROM symbols WHERE symbol = %s", (symbol,))
             if cur.fetchone() is None:
                 raise HTTPException(status_code=404, detail=f"symbol not found: {symbol}")
-            if days is not None:
+            if from_dt is not None or to_dt is not None:
+                clauses: list[str] = ["symbol = %s", "timeframe = %s"]
+                params: list[Any] = [symbol, timeframe]
+                if from_dt is not None:
+                    clauses.append("ts >= %s")
+                    params.append(from_dt)
+                if to_dt is not None:
+                    clauses.append("ts <= %s")
+                    params.append(to_dt)
+                cur.execute(
+                    "SELECT ts, open, high, low, close, volume FROM candles "
+                    f"WHERE {' AND '.join(clauses)} ORDER BY ts ASC",
+                    params,
+                )
+            elif days is not None:
                 cutoff = datetime.now(IST) - timedelta(days=days)
                 cur.execute(
                     "SELECT ts, open, high, low, close, volume FROM candles "
@@ -253,14 +288,18 @@ def get_candles(
     symbol: str = Query(..., min_length=1, description="Ticker symbol, e.g. TCS"),
     timeframe: str = Query("1d", description="Candle timeframe: 1d, 5m or 15m"),
     days: int | None = Query(None, ge=1, le=365, description="Return candles with ts >= now_IST - days (wins over limit)"),
-    limit: int = Query(250, ge=1, le=5000, description="Newest N candles to return when `days` is not given"),
+    from_date: str | None = Query(None, alias="from", description="Exclusive start date YYYY-MM-DD (wins over days)"),
+    to_date: str | None = Query(None, alias="to", description="Inclusive end date YYYY-MM-DD (wins over days)"),
+    limit: int = Query(250, ge=1, le=5000, description="Newest N candles to return when neither days nor from/to is given"),
 ) -> dict[str, Any]:
     """OHLCV candles for one symbol+timeframe, oldest-first.
 
-    Either the newest ``limit`` candles or — when ``days`` is provided — every
-    candle within the trailing window (``days`` takes precedence).
+    Precedence: explicit ``from``/``to`` range > trailing ``days`` window >
+    newest ``limit`` candles.
     """
-    rows = _fetch_candle_rows(symbol, timeframe, days, limit)
+    from_dt = _parse_date(from_date)
+    to_dt = _parse_date(to_date, end_of_day=True)
+    rows = _fetch_candle_rows(symbol, timeframe, days, limit, from_dt, to_dt)
     for c in rows:
         c["ts"] = _iso(c["ts"])
     return {"symbol": symbol, "timeframe": timeframe, "candles": rows}
@@ -271,15 +310,19 @@ def get_indicators(
     symbol: str = Query(..., min_length=1, description="Ticker symbol, e.g. TCS"),
     timeframe: str = Query("1d", description="Candle timeframe: 1d, 5m or 15m"),
     days: int | None = Query(None, ge=1, le=365, description="Return candles with ts >= now_IST - days (wins over limit)"),
-    limit: int = Query(250, ge=1, le=5000, description="Newest N candles to use when `days` is not given"),
+    from_date: str | None = Query(None, alias="from", description="Exclusive start date YYYY-MM-DD (wins over days)"),
+    to_date: str | None = Query(None, alias="to", description="Inclusive end date YYYY-MM-DD (wins over days)"),
+    limit: int = Query(250, ge=1, le=5000, description="Newest N candles to use when neither days nor from/to is given"),
 ) -> dict[str, Any]:
     """OHLCV candles augmented with SMA/EMA/RSI/MACD/Bollinger/volume-SMA.
 
-    Same row-selection semantics as /api/candles (days wins over limit),
+    Same row-selection semantics as /api/candles (from/to > days > limit),
     oldest-first. Warmup rows keep null indicator values — they are not
     dropped so the frontend can render partial curves. Floats rounded to 2dp.
     """
-    rows = _fetch_candle_rows(symbol, timeframe, days, limit)
+    from_dt = _parse_date(from_date)
+    to_dt = _parse_date(to_date, end_of_day=True)
+    rows = _fetch_candle_rows(symbol, timeframe, days, limit, from_dt, to_dt)
     df = pd.DataFrame(rows).set_index("ts").sort_index()
     computed = _compute_indicators(df)
     indicator_cols = list(_INDICATOR_COLS)

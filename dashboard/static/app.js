@@ -3,14 +3,15 @@
    Consumes the FastAPI JSON contract:
      GET /api/health        -> {status, db_ok, market_open, candles_total}
      GET /api/symbols       -> {symbols: [{symbol, name, instrument_type}]}
-     GET /api/candles?symbol=&timeframe=&days=
-                            -> {symbol, timeframe, candles:[{ts, open, high,
-                               low, close, volume}]} (ts ASC)
-     GET /api/indicators?symbol=&timeframe=&days=
-                            -> same candles + sma20, sma50, ema12, ema26,
-                               rsi14, macd, macd_signal, macd_hist,
-                               bb_upper, bb_mid, bb_lower, vol_sma20
-                               (indicator fields are null during warmup)
+     GET /api/candles?symbol=&timeframe=&days=&from=&to=
+                             -> {symbol, timeframe, candles:[{ts, open, high,
+                                low, close, volume}]} (ts ASC; from/to
+                                YYYY-MM-DD inclusive, wins over days)
+     GET /api/indicators?symbol=&timeframe=&days=&from=&to=
+                             -> same candles + sma20, sma50, ema12, ema26,
+                                rsi14, macd, macd_signal, macd_hist,
+                                bb_upper, bb_mid, bb_lower, vol_sma20
+                                (indicator fields are null during warmup)
      GET /api/movers?n=     -> {gainers:[...], losers:[...]}
      GET /api/portfolio     -> {summary:{...}, positions:[]}
      GET /api/sentiment?symbol= -> {rows:[{title, url, source,
@@ -42,10 +43,14 @@ var API = {
 var DEFAULT_SYMBOL = 'TCS';
 var DEFAULT_TIMEFRAME = '1d';
 var REFRESH_MS = 60 * 1000;      // silent auto-refresh of movers + status chip
-var MAX_POINTS = 1500;           // downsample above this (bucketing)
+var MAX_POINTS = 2500;           // downsample above this (bucketing)
 
-// Deep-history windows per timeframe.
-var DAYS_BY_TF = { '1d': 180, '15m': 90, '5m': 60 };
+// Date-range presets (months back from today, local tz). MAX = everything
+// the backend has for the timeframe (requested via limit=5000, no from/to).
+var PRESETS = { '1M': 1, '3M': 3, '6M': 6 };
+var PRESET_KEYS = ['1M', '3M', '6M', 'MAX'];
+var DEFAULT_PRESET_BY_TF = { '1d': '6M', '15m': '3M', '5m': '1M' };
+var MAX_FETCH_LIMIT = 5000;      // backend cap for the MAX preset
 var TF_LABEL = { '1d': '1D', '15m': '15M', '5m': '5M' };
 
 // Indicator fields carried on /api/indicators candles.
@@ -79,6 +84,11 @@ var currentItems = [];       // last rendered (possibly downsampled) items
 var hasIndicators = false;   // true when the indicators feed is available
 var indicatorsState = { sma20: true, sma50: true, ema: false, bb: false };
 
+// Active chart date range. preset is '1M'|'3M'|'6M'|'MAX' or null for custom.
+var currentRange = { from: null, to: null };   // resolved YYYY-MM-DD bounds
+var activePreset = null;                       // preset key currently in effect
+var presetTouched = false;                     // true once user picks preset/custom
+
 var loadSeq = 0;             // guards against out-of-order candle responses
 var sentimentSeq = 0;        // guards out-of-order sentiment responses
 var statusTimer = null;
@@ -105,7 +115,11 @@ var el = {
   sentimentBody: $('#sentiment-body'),
   sentimentSymbol: $('#sentiment-symbol'),
   tfButtons: Array.prototype.slice.call(document.querySelectorAll('.tf-btn')),
-  indChips: Array.prototype.slice.call(document.querySelectorAll('.ind-chip'))
+  indChips: Array.prototype.slice.call(document.querySelectorAll('.ind-chip')),
+  presetBtns: Array.prototype.slice.call(document.querySelectorAll('.preset-btn')),
+  fromDate: $('#from-date'),
+  toDate: $('#to-date'),
+  applyRangeBtn: $('#apply-range')
 };
 
 /* ---------- Chart.js setup ---------- */
@@ -208,6 +222,76 @@ function showToast(msg, isError) {
   }, isError ? 6000 : 2500);
 }
 
+/* ---------- Date range ---------- */
+function pad2(n) { return (n < 10 ? '0' : '') + n; }
+
+// Local-timezone YYYY-MM-DD (never toISOString: that is UTC).
+function toDateStr(d) {
+  return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+}
+
+// Resolved from/to (YYYY-MM-DD) for a preset key, relative to today (local tz).
+function presetDates(key) {
+  if (key === 'MAX') { return { from: null, to: null }; }
+  var today = new Date();
+  today.setHours(0, 0, 0, 0);
+  var from = new Date(today);
+  from.setMonth(from.getMonth() - PRESETS[key]);
+  return { from: toDateStr(from), to: toDateStr(today) };
+}
+
+// Set the active preset without reloading (keeps the UI in sync).
+function setPreset(key) {
+  activePreset = key;
+  var d = presetDates(key);
+  currentRange = { from: d.from, to: d.to };
+  syncRangeUI();
+}
+
+function applyPreset(key) {
+  setPreset(key);
+  presetTouched = true;
+  loadChart();
+}
+
+function applyCustomRange() {
+  var from = el.fromDate.value || null;
+  var to = el.toDate.value || null;
+  if (!from && !to) {
+    showToast('Pick at least one of From / To', true);
+    return;
+  }
+  if (from && to && from > to) {
+    var t = from; from = to; to = t;
+    el.fromDate.value = from;
+    el.toDate.value = to;
+    showToast('From was after To — swapped', false);
+  }
+  activePreset = null;
+  currentRange = { from: from, to: to };
+  presetTouched = true;
+  syncRangeUI();
+  loadChart();
+}
+
+function syncRangeUI() {
+  el.presetBtns.forEach(function (b) {
+    b.classList.toggle('active', b.getAttribute('data-preset') === activePreset);
+  });
+  el.fromDate.value = currentRange.from || '';
+  el.toDate.value = currentRange.to || '';
+}
+
+// Query params for the current range. Presets (except MAX) and custom ranges
+// use from/to; MAX asks the backend for its full limit without from/to.
+function rangeParams() {
+  if (activePreset === 'MAX') { return 'limit=' + MAX_FETCH_LIMIT; }
+  var p = [];
+  if (currentRange.from) { p.push('from=' + encodeURIComponent(currentRange.from)); }
+  if (currentRange.to) { p.push('to=' + encodeURIComponent(currentRange.to)); }
+  return p.join('&');
+}
+
 /* ---------- API ---------- */
 function fetchJson(url) {
   return fetch(url).then(function (res) {
@@ -278,16 +362,32 @@ function buildGroup(label, list) {
 }
 
 /* ---------- Chart data loading ---------- */
-function candlesUrl(sym, tf) {
-  return API.candles + '?symbol=' + encodeURIComponent(sym) +
-         '&timeframe=' + encodeURIComponent(tf) +
-         '&days=' + DAYS_BY_TF[tf];
-}
-
-function indicatorsUrl(sym, tf) {
-  return API.indicators + '?symbol=' + encodeURIComponent(sym) +
-         '&timeframe=' + encodeURIComponent(tf) +
-         '&days=' + DAYS_BY_TF[tf];
+// Fetch one series feed for the active symbol/timeframe/range. MAX expands
+// past the backend's 5000-row cap: when the first call returns a full batch,
+// fetch the older tail via from=<earliest ts day> and merge (deduped by ts).
+function fetchSeries(path, sym, tf) {
+  var base = path + '?symbol=' + encodeURIComponent(sym) +
+             '&timeframe=' + encodeURIComponent(tf);
+  var q = rangeParams();
+  var url = base + (q ? '&' + q : '');
+  return fetchJson(url).then(function (data) {
+    if (activePreset !== 'MAX') { return data; }
+    var candles = Array.isArray(data.candles) ? data.candles : [];
+    if (!candles.length || candles.length < MAX_FETCH_LIMIT) { return data; }
+    var earliest = candles[0].ts;
+    var fromDate = (typeof earliest === 'string' && earliest.length >= 10)
+      ? earliest.slice(0, 10) : null;
+    if (!fromDate) { return data; }
+    return fetchJson(base + '&from=' + encodeURIComponent(fromDate)).then(function (older) {
+      var olderCandles = Array.isArray(older.candles) ? older.candles : [];
+      var seen = {}, merged = [];
+      olderCandles.concat(candles).forEach(function (c) {
+        var k = c.ts;
+        if (!seen[k]) { seen[k] = 1; merged.push(c); }
+      });
+      return { symbol: data.symbol, timeframe: data.timeframe, candles: merged };
+    });
+  });
 }
 
 function loadChart() {
@@ -298,12 +398,12 @@ function loadChart() {
 
   // Prefer the indicators feed (it carries OHLCV + indicator columns); fall
   // back to plain candles when it is unavailable (older backend).
-  fetchJson(indicatorsUrl(sym, tf)).then(function (data) {
+  fetchSeries(API.indicators, sym, tf).then(function (data) {
     if (seq !== loadSeq) { return; }
     renderAll(data, true);
   }).catch(function () {
     if (seq !== loadSeq) { return; }
-    fetchJson(candlesUrl(sym, tf)).then(function (data) {
+    fetchSeries(API.candles, sym, tf).then(function (data) {
       if (seq !== loadSeq) { return; }
       renderAll(data, false);
     }).catch(function (err) {
@@ -720,12 +820,9 @@ function renderMacdPanel() {
       animation: { duration: 200 },
       interaction: { mode: 'index', intersect: false },
       plugins: {
-        legend: {
-          display: true,
-          position: 'top',
-          align: 'end',
-          labels: { boxWidth: 10, boxHeight: 2, font: { size: 9 }, color: '#8b949e', padding: 6 }
-        },
+        // Legend hidden so every sub-panel is a pixel-identical column
+        // (same fixed canvas height); dataset names still show in tooltips.
+        legend: { display: false },
         tooltip: Object.assign({}, TOOLTIP_STYLE, {
           callbacks: {
             title: function (items) { return items && items.length ? fmtTs(items[0].parsed.x) : ''; },
@@ -778,7 +875,9 @@ function updateChartMeta() {
   }
   var first = currentItems[0].x;
   var last = currentItems[currentItems.length - 1].x;
-  el.chartRange.textContent = fmtRange(first, last) + ' · ' + currentItems.length + ' bars';
+  var from = currentRange.from || first;
+  var to = currentRange.to || last;
+  el.chartRange.textContent = fmtRange(from, to) + ' · ' + currentItems.length + ' bars';
 }
 
 function setChipsEnabled(enabled) {
@@ -953,7 +1052,29 @@ el.tfButtons.forEach(function (btn) {
     if (!tf || tf === currentTimeframe) { return; }
     currentTimeframe = tf;
     el.tfButtons.forEach(function (b) { b.classList.toggle('active', b === btn); });
+    // Re-apply the current preset (or the new timeframe's default when the
+    // user never picked one); keep a custom range untouched.
+    if (!presetTouched) {
+      setPreset(DEFAULT_PRESET_BY_TF[tf] || '6M');
+    } else if (activePreset) {
+      setPreset(activePreset);
+    }
     loadChart();
+  });
+});
+
+el.presetBtns.forEach(function (btn) {
+  btn.addEventListener('click', function () {
+    var key = btn.getAttribute('data-preset');
+    if (key) { applyPreset(key); }
+  });
+});
+
+el.applyRangeBtn.addEventListener('click', applyCustomRange);
+
+[el.fromDate, el.toDate].forEach(function (inp) {
+  inp.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { applyCustomRange(); }
   });
 });
 
@@ -974,6 +1095,9 @@ function init() {
     return;
   }
   setupChartDefaults();
+
+  // Initial range: the timeframe's default preset (1d → 6M, 15m → 3M, 5m → 1M).
+  setPreset(DEFAULT_PRESET_BY_TF[DEFAULT_TIMEFRAME] || '6M');
 
   loadHealth();
   loadMovers();

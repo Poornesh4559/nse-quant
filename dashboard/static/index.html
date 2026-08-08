@@ -47,6 +47,23 @@
         </div>
       </div>
 
+      <!-- Date range controls: presets + custom From/To -->
+      <div class="range-controls">
+        <span class="range-label" aria-hidden="true">Range</span>
+        <div class="preset-group" role="group" aria-label="Date range presets">
+          <button type="button" class="preset-btn" data-preset="1M" title="Last 1 month">1M</button>
+          <button type="button" class="preset-btn" data-preset="3M" title="Last 3 months">3M</button>
+          <button type="button" class="preset-btn" data-preset="6M" title="Last 6 months">6M</button>
+          <button type="button" class="preset-btn" data-preset="MAX" title="All available data">MAX</button>
+        </div>
+        <span class="range-divider" aria-hidden="true"></span>
+        <label for="from-date" class="range-label">From</label>
+        <input type="date" id="from-date" title="Start date (inclusive)">
+        <label for="to-date" class="range-label">To</label>
+        <input type="date" id="to-date" title="End date (inclusive)">
+        <button type="button" id="apply-range" class="apply-btn" title="Apply custom range">Apply</button>
+      </div>
+
       <div class="chart-body">
         <div class="chart-wrap">
           <canvas id="candle-chart"></canvas>
