@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS news_sentiment (
     sentiment_label    TEXT                    -- POSITIVE / NEUTRAL / NEGATIVE
 );
 CREATE INDEX IF NOT EXISTS idx_news_pub ON news_sentiment (published_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_news_url ON news_sentiment (url);
 
 -- Paper trades (Phase 5)
 CREATE TABLE IF NOT EXISTS trades (
