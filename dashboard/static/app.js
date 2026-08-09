@@ -601,6 +601,7 @@ function destroyAllCharts() {
 function timeScaleOpts(hideTicks) {
   return {
     type: 'time',
+    distribution: 'series',   // index-based spacing: collapses weekend/overnight gaps (TradingView-style)
     time: {
       unit: currentUnit,
       displayFormats: { day: 'dd MMM', hour: 'HH:mm', minute: 'HH:mm' }
