@@ -82,7 +82,7 @@ nse-quant/
 | **1** | Data collector: EOD OHLC → TimescaleDB, daily + intraday cron | ✅ LIVE — cron runs Mon-Fri (intraday 5-min, EOD 18:00 IST, token refresh 8:00 IST) |
 | **2** | Dashboard: candles, movers, market status | ✅ LIVE — **https://stock.poornesh.dev** (FastAPI + Chart.js via tunnel) |
 | **3** | News + sentiment pipeline (Google News RSS + market feeds + reddit + GDELT → VADER+FinBERT dual-model avg → per-symbol scores) | ✅ LIVE — daily cron 19:00 IST, 60-day backfill, dashboard sentiment card |
-| **4** | Backtesting + signal research (pandas/vectorbt/ML) | ⏳ |
+| **4** | Backtesting + signal research (pandas/vectorbt/ML) | 🚧 FOUNDATION DONE — `analysis/` package: no-lookahead engine (next-open fills, ₹20-min/0.1% fees), 7 classic strategies, metrics, `python -m analysis.research run|bench` on 5y NIFTY 50 data; 13/13 pytest green |
 | **5** | Paper trading bot on Fyers (simulated first) | ⏳ |
 
 ## ⏰ Scheduled Jobs (for Hermes / cron)

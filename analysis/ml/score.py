@@ -32,6 +32,18 @@ PICKS_PATH = SIGNALS_DIR / "nextday_picks.json"
 
 GUARDRAIL = -0.1
 TOP_N = 5
+# Composite weights (the v1 bot ranking — sentiment is a TILT + GATE):
+MOM_W = 0.40   # cross-sectional momentum percentile
+ML_W = 0.35    # ML next-day probability
+SENT_W = 0.25  # sentiment (sent_3d, clipped [-1,1] -> [0,1])
+
+
+def composite(row) -> float:
+    """Blend momentum + ML + sentiment into the v1 ranking score (0..1)."""
+    mom = 0.5 if pd.isna(row.get("mom_rank")) else float(row["mom_rank"])
+    ml = 0.5 if pd.isna(row.get("p_up")) else float(row["p_up"])
+    sent = 0.0 if pd.isna(row.get("sent_3d")) else float(np.clip(row["sent_3d"], -1, 1))
+    return float(np.clip(MOM_W * mom + ML_W * ((ml - 0.5) * 2.0) + SENT_W * ((sent + 1) / 2.0), 0, 1))
 
 
 def predict_next(today: str | dt.date | None = None,
@@ -54,33 +66,48 @@ def predict_next(today: str | dt.date | None = None,
     last_date = meta.loc[valid, "date"].max()
     sel = valid & (meta["date"] == last_date)
 
-    p_up = model.predict_proba(X.loc[sel])[:, 1]
+    # the paper bot trades equities only — drop INDEX instruments from the rank
+    from analysis.data import BENCHMARK_SYMBOL
+    tradable = ~meta.loc[sel, "symbol"].isin((BENCHMARK_SYMBOL, "BANKNIFTY"))
+    sel_idx = sel[sel].index[tradable.values]
+
+    p_up = model.predict_proba(X.loc[sel_idx])[:, 1]
     out = pd.DataFrame({
-        "symbol": meta.loc[sel, "symbol"].values,
+        "symbol": meta.loc[sel_idx, "symbol"].values,
         "p_up": p_up,
-        "sent_3d": X.loc[sel, "sent_3d"].values,
-        "mom_rank": X.loc[sel, "mom_rank"].values,
+        "sent_3d": X.loc[sel_idx, "sent_3d"].values,
+        "mom_rank": X.loc[sel_idx, "mom_rank"].values,
     })
     out["rank"] = out["p_up"].rank(ascending=False, method="first").astype(int)
-    out = out.sort_values("rank").reset_index(drop=True)
+    out["composite"] = out.apply(composite, axis=1)
+    out = out.sort_values("composite", ascending=False).reset_index(drop=True)
+    out["rank"] = range(1, len(out) + 1)
     out["pass_guardrail"] = out["sent_3d"] > GUARDRAIL
 
     picks = out[out["pass_guardrail"]].head(top_n)
     calendar = sorted(meta["date"].unique())
     nxt = next((d for d in calendar if d > last_date), None)
+    nxt_estimated = False
+    if nxt is None:
+        # market calendar not in the DB yet (weekend/holiday) — estimate next weekday
+        nxt = pd.bdate_range(last_date + pd.Timedelta(days=1), periods=1)[0]
+        nxt_estimated = True
 
     result = {
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
         "as_of": str(last_date.date()),
-        "next_trade_date": str(nxt.date()) if nxt is not None else None,
+        "next_trade_date": str(nxt.date()),
+        "next_trade_date_estimated": nxt_estimated,
         "model": str(model_path),
         "guardrail": GUARDRAIL,
         "top5": [{"rank": int(r["rank"]), "symbol": r["symbol"], "p_up": round(float(r["p_up"]), 4),
                   "sent_3d": round(float(r["sent_3d"]), 4),
-                  "mom_rank": None if np.isnan(r["mom_rank"]) else round(float(r["mom_rank"]), 4)}
+                  "mom_rank": None if np.isnan(r["mom_rank"]) else round(float(r["mom_rank"]), 4),
+                  "composite": round(float(r["composite"]), 4)}
                  for _, r in picks.iterrows()],
         "top10": [{"rank": int(r["rank"]), "symbol": r["symbol"], "p_up": round(float(r["p_up"]), 4),
                    "sent_3d": round(float(r["sent_3d"]), 4),
+                   "composite": round(float(r["composite"]), 4),
                    "pass_guardrail": bool(r["pass_guardrail"])}
                   for _, r in out.head(10).iterrows()],
     }
@@ -88,9 +115,10 @@ def predict_next(today: str | dt.date | None = None,
 
 
 def print_picks(result: dict) -> None:
+    est = " (estimated)" if result["next_trade_date_estimated"] else ""
     print(f"\nTODAY'S TOP-{TOP_N} PICKS  (signals as of {result['as_of']}, "
-          f"next trade date {result['next_trade_date']})")
-    print("guardrail: sent_3d <= -0.1 blocks entry | market gate: off (later phase)")
+          f"next trade date {result['next_trade_date']}{est})")
+    print("guardrail: sent_3d <= -0.1 blocks entry | market gate: off (later phase) | INDEX symbols excluded")
     print(f"\n{'#':<3}{'symbol':<14}{'P_up':>8}{'sent_3d':>9}{'mom_rank':>10}")
     print("-" * 44)
     for p in result["top5"]:

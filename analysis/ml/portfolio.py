@@ -30,6 +30,7 @@ import numpy as np
 import pandas as pd
 
 from analysis.data import BENCHMARK_SYMBOL, load_daily
+from analysis.engine import FeeSchedule
 from analysis.ml.train import OOS_PATH, MODELS_DIR, walk_forward_train
 from analysis.ml.panel import build_panel
 
@@ -43,8 +44,10 @@ class PortfolioConfig:
     weight: float = 0.2            # 1/top_n — equal weight per entry
     stop_loss: float = 0.05        # -5% intraday close stop -> exit next open
     sent_guardrail: float = -0.1   # never enter symbols with sent_3d <= this
-    cost_rate: float = 0.001       # per side, matching BacktestConfig default
-    min_fee: float = 20.0
+    fees: FeeSchedule = field(default_factory=FeeSchedule)  # REAL Indian costs
+    turnover_buffer: int = 2       # hold until rank > top_n + buffer (cut churn)
+    regime_sma: int = 50           # price regime proxy: NIFTY 50 above SMA50
+    regime_min_above_pct: float = 0.0  # require close > sma (0 = just above)
     initial_capital: float = 1_000_000.0
     index_cost_round_trip: float = 0.001  # 0.1% total for the buy-hold benchmark
     exclude_symbols: tuple[str, ...] = (BENCHMARK_SYMBOL, "BANKNIFTY")  # INDEX instruments
@@ -73,12 +76,15 @@ def _metrics(equity: pd.Series, capital: float) -> dict:
 
 
 def simulate_portfolio(frames: dict[str, pd.DataFrame], preds: pd.DataFrame,
-                       cfg: PortfolioConfig | None = None) -> dict:
+                       cfg: PortfolioConfig | None = None,
+                       regime: pd.Series | None = None) -> dict:
     """Run the top-N daily-rebalance sim over the OOS window.
 
     ``preds`` must have columns symbol, date (signal date t), p_up, sent_3d.
-    Trade date = next calendar day after the signal date. Returns a dict with
-    the equity curve, trade log, stop/fee counters and metrics.
+    Trade date = next calendar day after the signal date. ``regime`` (optional)
+    is a Series indexed by SIGNAL date with True = risk-on: on risk-off days
+    everything is sold at the next open and no buys happen (market gate).
+    Returns a dict with the equity curve, trade log, stop/fee counters/metrics.
     """
     cfg = cfg or PortfolioConfig()
     calendar = pd.DatetimeIndex(sorted({d for df in frames.values() for d in df.index}))
@@ -88,6 +94,7 @@ def simulate_portfolio(frames: dict[str, pd.DataFrame], preds: pd.DataFrame,
     for sig_date, g in preds.groupby("date"):
         pred_map[pd.Timestamp(sig_date)] = g
     signal_dates = set(pred_map)
+    risk_on = regime if regime is not None else None
 
     cash = cfg.initial_capital
     qty: dict[str, float] = {}
@@ -119,6 +126,21 @@ def simulate_portfolio(frames: dict[str, pd.DataFrame], preds: pd.DataFrame,
         has_signal = sig_date in signal_dates
 
         stopped_today: set[str] = set()
+        # ---- 0) market regime gate: risk-off sells everything at next open ----
+        regime_off = bool(risk_on is not None and sig_date in risk_on.index and not bool(risk_on.loc[sig_date]))
+        if regime_off:
+            for s in list(qty):
+                op = px(s, d, "open")
+                if op is None:
+                    continue
+                notional = qty[s] * op
+                fee = cfg.fees.exit_fee(notional)
+                cash += notional - fee
+                fees_total += fee
+                trades.append({"symbol": s, "side": "REGIME-OFF", "date": d, "price": op,
+                               "qty": qty[s], "notional": notional, "fee": fee})
+                del qty[s], entry[s]
+
         # ---- 1) stop-loss exits at today's open (checked on yesterday's close) ----
         for s in list(qty):
             lc = last_close.get(s)
@@ -127,7 +149,7 @@ def simulate_portfolio(frames: dict[str, pd.DataFrame], preds: pd.DataFrame,
                 if op is None:
                     continue  # no quote today — defer the stop to the next valid open
                 notional = qty[s] * op
-                fee = max(cfg.cost_rate * notional, cfg.min_fee)
+                fee = cfg.fees.exit_fee(notional)
                 cash += notional - fee
                 fees_total += fee
                 n_stops += 1
@@ -137,33 +159,42 @@ def simulate_portfolio(frames: dict[str, pd.DataFrame], preds: pd.DataFrame,
                 stopped_today.add(s)
 
         # ---- 2) rebalance to the top-N target (only when we have a signal) ----
-        if has_signal:
+        if has_signal and not regime_off:
             sub = pred_map[sig_date]
             sub = sub[sub["symbol"].isin(tradable)]
             sub = sub[sub["sent_3d"] > cfg.sent_guardrail]           # guardrail
             sub = sub.sort_values("p_up", ascending=False)
             target = set(sub["symbol"].iloc[: cfg.top_n])
+            ranked = list(sub["symbol"].iloc[: cfg.top_n + cfg.turnover_buffer])
+            rank_pos = {s: i for i, s in enumerate(ranked)}
 
             equity_open = cash
             for s in qty:
                 op = px(s, d, "open")
                 equity_open += qty[s] * (op if op is not None else last_close.get(s, 0.0))
-            # sells: held names that left the target
+            # sells: held names that fell OUT of the buffer zone
+            # (a name ranked top_n..top_n+buffer is held — no churn tax)
             for s in list(qty):
-                if s in target or s in stopped_today:
+                if s in stopped_today:
+                    continue
+                hold_rank = rank_pos.get(s)
+                if hold_rank is not None and hold_rank < cfg.top_n + cfg.turnover_buffer:
                     continue
                 op = px(s, d, "open")
                 if op is None:
                     continue
                 notional = qty[s] * op
-                fee = max(cfg.cost_rate * notional, cfg.min_fee)
+                fee = cfg.fees.exit_fee(notional)
                 cash += notional - fee
                 fees_total += fee
                 trades.append({"symbol": s, "side": "SELL", "date": d, "price": op,
                                "qty": qty[s], "notional": notional, "fee": fee})
                 del qty[s], entry[s]
-            # buys: target names not held (stopped symbols wait until next day)
+            # buys: fill free top-N slots with target names not held
+            # (stopped symbols wait until next day)
             for s in sorted(target - set(qty) - stopped_today):
+                if len(qty) >= cfg.top_n:
+                    break
                 op = px(s, d, "open")
                 if op is None or op <= 0:
                     continue
@@ -171,7 +202,7 @@ def simulate_portfolio(frames: dict[str, pd.DataFrame], preds: pd.DataFrame,
                 q = notional / op
                 if q <= 0:
                     continue
-                fee = max(cfg.cost_rate * notional, cfg.min_fee)
+                fee = cfg.fees.entry_fee(notional)
                 cash -= notional + fee
                 fees_total += fee
                 qty[s] = q
@@ -221,10 +252,11 @@ def simulate_buyhold(frames: dict[str, pd.DataFrame], trade_window: tuple[pd.Tim
 
 
 def run_comparison(frames: dict[str, pd.DataFrame], preds: pd.DataFrame,
-                   cfg: PortfolioConfig | None = None) -> dict:
-    """Full OOS comparison: ML top-N portfolio vs buy-hold NIFTY 50."""
+                   cfg: PortfolioConfig | None = None,
+                   regime: pd.Series | None = None) -> dict:
+    """Full OOS comparison: top-N portfolio vs buy-hold NIFTY 50."""
     cfg = cfg or PortfolioConfig()
-    ml = simulate_portfolio(frames, preds, cfg)
+    ml = simulate_portfolio(frames, preds, cfg, regime=regime)
     bh = simulate_buyhold(frames, ml["trade_window"], cfg)
     ml_m, bh_m = ml["metrics"], bh["metrics"]
     return {
@@ -274,8 +306,8 @@ def main(argv: list[str] | None = None) -> int:
     comp = run_comparison(frames, preds, cfg)
     print(f"\nOOS window: {comp['ml']['trade_window'][0].date()} -> {comp['ml']['trade_window'][1].date()} "
           f"({len(comp['ml']['equity'])} trading days) | capital ₹{cfg.initial_capital:,.0f} | "
-          f"cost {cfg.cost_rate * 100:.1f}%/side | stop -{cfg.stop_loss * 100:.0f}% | "
-          f"guardrail sent_3d <= {cfg.sent_guardrail}")
+          f"fees: real Fyers/NSE | stop -{cfg.stop_loss * 100:.0f}% | "
+          f"guardrail sent_3d <= {cfg.sent_guardrail} | buffer {cfg.turnover_buffer}")
     print_table(comp)
 
     # honest verdict

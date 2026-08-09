@@ -17,6 +17,7 @@ import pandas as pd
 import pytest
 
 from analysis.ml.panel import build_panel
+from analysis.engine import FeeSchedule
 from analysis.ml.portfolio import PortfolioConfig, simulate_portfolio
 from analysis.ml.train import walk_forward_splits
 
@@ -143,10 +144,14 @@ def test_walk_forward_60pct_fallback():
 
 def _port_cfg(**kw) -> PortfolioConfig:
     kw.setdefault("initial_capital", 100_000.0)
-    kw.setdefault("cost_rate", 0.001)
-    kw.setdefault("min_fee", 0.0)
+    kw.setdefault("fees", FeeSchedule(
+        brokerage_fixed=1e9, brokerage_pct=0.001,  # uncapped 0.1% — legacy flat model for hand-checks
+        stt_sell_pct=0.0, exchange_pct=0.0, sebi_pct=0.0,
+        stamp_buy_pct=0.0, gst_pct=0.0, dp_charge=0.0, slippage_bps=0.0,
+    ))
     kw.setdefault("weight", 0.5)
     kw.setdefault("top_n", 2)
+    kw.setdefault("turnover_buffer", 0)  # strict top-N for hand-check tests
     kw.setdefault("exclude_symbols", ())
     return PortfolioConfig(**kw)
 
