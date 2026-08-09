@@ -79,8 +79,8 @@ var macdChart = null;
 var symbols = [];
 var currentSymbol = DEFAULT_SYMBOL;
 var currentTimeframe = DEFAULT_TIMEFRAME;
-var currentUnit = 'day';
 var currentItems = [];       // last rendered (possibly downsampled) items
+var currentLabels = [];      // per-candle x-axis labels (category scale, index-aligned)
 var hasIndicators = false;   // true when the indicators feed is available
 var indicatorsState = { sma20: true, sma50: true, ema: false, bb: false };
 
@@ -128,6 +128,23 @@ function setupChartDefaults() {
   if (typeof ChartFinancial !== 'undefined') {
     Chart.register(ChartFinancial);
   }
+  // Fix chartjs-chart-financial 0.2.1 + Chart.js 4.4 tooltip crash:
+  // core Tooltip._getLabel calls controller.getLabelAndValue(element) but the
+  // plugin expects a NUMBER index — getParsed(element) returns undefined and
+  // every hover throws (tooltip silently dead). Resolve the element's index.
+  var FinCtl = Chart.registry.getController('candlestick');
+  if (FinCtl && !FinCtl.prototype.__candleTooltipFix) {
+    FinCtl.prototype.getLabelAndValue = function (elOrIdx) {
+      var idx = (typeof elOrIdx === 'object' && elOrIdx !== null) ? elOrIdx.index : elOrIdx;
+      var parsed = this.getParsed(idx);
+      if (!parsed) { return { label: '', value: '' }; }
+      return {
+        label: String(idx + 1),
+        value: 'O: ' + parsed.o + '  H: ' + parsed.h + '  L: ' + parsed.l + '  C: ' + parsed.c
+      };
+    };
+    FinCtl.prototype.__candleTooltipFix = true;
+  }
   // chartjs-adapter-luxon auto-registers on load; explicit register is a
   // no-op if already registered but guards against CDN variants that don't.
   if (window.chartjsAdapterLuxon) {
@@ -155,8 +172,9 @@ function mkEl(tag, className, text) {
 }
 
 // chartjs-chart-financial sets parsing:false on the whole chart, so every
-// dataset x must be a numeric epoch-ms timestamp — ISO strings leave the
-// candlestick elements unparsed and the main chart renders empty.
+// dataset item is used as-is ({x, o, h, l, c} / {x, y}); x is the candle's
+// ARRAY INDEX (category scale) while the epoch-ms timestamp lives on the
+// parallel currentItems[i].x (tooltips / range meta resolve through it).
 function toMs(ts) {
   if (typeof ts === 'number') { return ts; }
   if (window.luxon && luxon.DateTime) {
@@ -460,10 +478,9 @@ function renderAll(data, withIndicators) {
     return it;
   });
   currentItems = downsample(currentItems, MAX_POINTS);
+  currentLabels = buildLabels();
   hasIndicators = withIndicators;
   setChipsEnabled(hasIndicators);
-
-  currentUnit = currentTimeframe === '1d' ? 'day' : 'hour';
 
   renderMainChart();
   renderVolumePanel();
@@ -503,10 +520,33 @@ function downsample(items, maxPoints) {
 }
 
 /* ---------- Series builders ---------- */
-function pts(field) {
+// Per-candle x-axis labels for the category scale: 1d → '06 Aug', intraday →
+// 'HH:mm' (the ticks callback surfaces the date at day boundaries; tooltips
+// always show the full date via fmtTs, never these short labels).
+function buildLabels() {
   return currentItems.map(function (it) {
+    var dt = toDateTime(it.x);
+    if (!dt) { return String(it.x); }
+    if (currentTimeframe === '1d') {
+      return dt.toFormat ? dt.toFormat('dd MMM') : fmtDay(it.x);
+    }
+    return dt.toFormat ? dt.toFormat('HH:mm') : fmtDay(it.x);
+  });
+}
+
+// Tooltip title for every chart: on a category scale the data index is the
+// position — resolve the candle's epoch-ms from the parallel currentItems
+// array to always show the full date+time. Uses dataIndex (never undefined),
+// not parsed.x, because parsing:false leaves parsed shape dataset-dependent.
+function tooltipTitle(items) {
+  var idx = items && items.length ? items[0].dataIndex : -1;
+  return (idx >= 0 && idx < currentItems.length) ? fmtTs(currentItems[idx].x) : '';
+}
+
+function pts(field) {
+  return currentItems.map(function (it, i) {
     var v = it[field];
-    return { x: it.x, y: (v === null || v === undefined) ? null : v };
+    return { x: i, y: (v === null || v === undefined) ? null : v };
   });
 }
 
@@ -515,6 +555,7 @@ function lineDataset(field, label, color, dash) {
     type: 'line',
     label: label,
     data: pts(field),
+    parsing: false,
     borderColor: color,
     borderWidth: 1.4,
     borderDash: dash || [],
@@ -533,11 +574,18 @@ function candleDataset() {
   return {
     type: 'candlestick',
     label: currentSymbol,
-    data: currentItems.map(function (it) {
-      return { x: it.x, o: it.o, h: it.h, l: it.l, c: it.c };
+    data: currentItems.map(function (it, i) {
+      return { x: i, o: it.o, h: it.h, l: it.l, c: it.c };
     }),
+    // NOTE: parsing must stay ENABLED for candlesticks — chartjs-chart-financial's
+    // tooltip getLabelAndValue/getParsed path crashes on parsing:false.
     color: { up: UP, down: DOWN, unchanged: FLAT },
     borderColor: { up: UP, down: DOWN, unchanged: FLAT },
+    // Explicit hover variants: the plugin's hover style resolution calls
+    // .toString() on the value — missing hover colors crash the hover/tooltip
+    // event pipeline (chart._active fills but tooltip never renders).
+    hoverBackgroundColor: { up: 'rgba(63,185,80,0.40)', down: 'rgba(248,81,73,0.40)', unchanged: FLAT },
+    hoverBorderColor: { up: UP, down: DOWN, unchanged: FLAT },
     order: 1
   };
 }
@@ -559,6 +607,7 @@ function buildMainDatasets() {
   if (indicatorsState.bb) {
     ds.push({
       type: 'line', label: 'BB Lower', data: pts('bb_lower'),
+      parsing: false,
       borderColor: C_BB, borderWidth: 1.2, borderDash: [3, 3],
       fill: false, spanGaps: false, tension: 0.2,
       pointRadius: 0, pointHoverRadius: 2, pointHitRadius: 4,
@@ -566,6 +615,7 @@ function buildMainDatasets() {
     });
     ds.push({
       type: 'line', label: 'BB Upper', data: pts('bb_upper'),
+      parsing: false,
       borderColor: C_BB, borderWidth: 1.2, borderDash: [3, 3],
       fill: { target: 'bbLower', above: 'rgba(57,197,207,0.07)' },
       spanGaps: false, tension: 0.2,
@@ -574,6 +624,7 @@ function buildMainDatasets() {
     });
     ds.push({
       type: 'line', label: 'BB Mid', data: pts('bb_mid'),
+      parsing: false,
       borderColor: C_BB, borderWidth: 1.2, borderDash: [8, 4],
       fill: false, spanGaps: false, tension: 0.2,
       pointRadius: 0, pointHoverRadius: 2, pointHitRadius: 4,
@@ -598,20 +649,51 @@ function destroyAllCharts() {
   lastHoverIndex = -1;
 }
 
-function timeScaleOpts(hideTicks) {
-  return {
-    type: 'time',
-    distribution: 'series',   // index-based spacing: collapses weekend/overnight gaps (TradingView-style)
-    time: {
-      unit: currentUnit,
-      displayFormats: { day: 'dd MMM', hour: 'HH:mm', minute: 'HH:mm' }
-    },
+// Category (index-based) x scale shared by every chart. Position is the data
+// ARRAY INDEX, so candles are ALWAYS evenly spaced — weekend/overnight gaps are
+// structurally impossible. All charts share the same per-candle labels array;
+// dataset x values are array indexes. hideTicks for the middle sub-panels
+// (TradingView single-axis look: main + bottom panel show the x labels).
+function xScaleOpts(labels, hideTicks) {
+  var opts = {
+    type: 'category',
+    labels: labels,
     grid: { color: 'rgba(139,148,158,0.10)' },
-    border: { color: '#30363d' },
-    ticks: hideTicks
-      ? { display: false }
-      : { color: '#8b949e', maxRotation: 0, autoSkip: true, maxTicksLimit: 6, font: { size: 9 } }
+    border: { color: '#30363d' }
   };
+  if (hideTicks) {
+    opts.ticks = { display: false };
+  } else {
+    opts.ticks = {
+      color: '#8b949e',
+      maxRotation: 0,
+      autoSkip: true,
+      maxTicksLimit: 10,
+      font: { size: 9 }
+    };
+    if (currentTimeframe !== '1d') {
+      // Intraday labels are 'HH:mm' and repeat across days — surface the date
+      // on the first tick of each day (tick.value is the data index).
+      opts.ticks.callback = intradayTickLabel;
+    }
+  }
+  return opts;
+}
+
+// Ticks callback for intraday timeframes: show the full date when this tick's
+// day differs from the previous DATA point, else the plain 'HH:mm'.
+function intradayTickLabel(value, i, ticks) {
+  var idx = Number(value);
+  if (!isFinite(idx) || idx < 0 || idx >= currentItems.length) { return String(value); }
+  var dt = toDateTime(currentItems[idx].x);
+  if (!dt) { return String(value); }
+  if (idx > 0) {
+    var prev = toDateTime(currentItems[idx - 1].x);
+    if (prev && dt.toFormat('yyyy-MM-dd') === prev.toFormat('yyyy-MM-dd')) {
+      return dt.toFormat('HH:mm');
+    }
+  }
+  return dt.toFormat('dd MMM HH:mm');
 }
 
 function renderMainChart() {
@@ -619,39 +701,42 @@ function renderMainChart() {
 
   chart = new Chart(el.chartCanvas, {
     type: 'candlestick',
-    data: { datasets: buildMainDatasets() },
+    data: { labels: currentLabels, datasets: buildMainDatasets() },
     options: {
       responsive: true,
       maintainAspectRatio: false,
       animation: { duration: 250 },
       interaction: { mode: 'index', intersect: false },
+      // chartjs-chart-financial 0.2.1 overrides hover.mode to 'label' — a
+      // Chart.js v3 mode that does NOT exist in v4.4's Interaction.modes, so
+      // chart._active stays empty and onHover/active never fire. Force index.
+      hover: { mode: 'index', intersect: false },
       onHover: function (evt, active) { syncHover(active); },
       plugins: {
         legend: { display: false },
         tooltip: Object.assign({}, TOOLTIP_STYLE, {
           callbacks: {
-            title: function (items) {
-              return items && items.length ? fmtTs(items[0].parsed.x) : '';
-            },
+            title: tooltipTitle,
             label: function (ctx) {
               if (ctx.dataset.type === 'line') {
-                var v = ctx.parsed.y;
+                var v = ctx.parsed && ctx.parsed.y;
                 return ctx.dataset.label + ': ' + (v === null || v === undefined ? '—' : Number(v).toFixed(2));
               }
-              var d = ctx.parsed;
-              var chg = d.c - d.o;
+              var it = currentItems[ctx.dataIndex];
+              if (!it) { return ''; }
+              var chg = it.c - it.o;
               return [
-                'Open:  ' + d.o.toFixed(2),
-                'High:  ' + d.h.toFixed(2),
-                'Low:   ' + d.l.toFixed(2),
-                'Close: ' + d.c.toFixed(2) + '  ' + (chg >= 0 ? '+' : '') + chg.toFixed(2)
+                'Open:  ' + it.o.toFixed(2),
+                'High:  ' + it.h.toFixed(2),
+                'Low:   ' + it.l.toFixed(2),
+                'Close: ' + it.c.toFixed(2) + '  ' + (chg >= 0 ? '+' : '') + chg.toFixed(2)
               ];
             }
           }
         })
       },
       scales: {
-        x: timeScaleOpts(false),
+        x: xScaleOpts(currentLabels, false),
         y: {
           position: 'right',
           grid: { color: 'rgba(139,148,158,0.12)' },
@@ -672,9 +757,11 @@ function renderVolumePanel() {
   volumeChart = new Chart(el.volumeCanvas, {
     type: 'bar',
     data: {
+      labels: currentLabels,
       datasets: [{
         label: 'Volume',
-        data: currentItems.map(function (it) { return { x: it.x, y: it.v }; }),
+        data: currentItems.map(function (it, i) { return { x: i, y: it.v }; }),
+        parsing: false,
         backgroundColor: volColors,
         borderWidth: 0,
         barPercentage: 0.9,
@@ -691,13 +778,13 @@ function renderVolumePanel() {
         legend: { display: false },
         tooltip: Object.assign({}, TOOLTIP_STYLE, {
           callbacks: {
-            title: function (items) { return items && items.length ? fmtTs(items[0].parsed.x) : ''; },
+            title: tooltipTitle,
             label: function (ctx) { return 'Volume: ' + fmtInt(ctx.parsed.y); }
           }
         })
       },
       scales: {
-        x: timeScaleOpts(true),
+        x: xScaleOpts(currentLabels, true),
         y: {
           position: 'right',
           beginAtZero: true,
@@ -711,11 +798,11 @@ function renderVolumePanel() {
 }
 
 function guideDataset(label, y, color) {
-  var first = currentItems[0], last = currentItems[currentItems.length - 1];
   return {
     type: 'line',
     label: label,
-    data: [{ x: first.x, y: y }, { x: last.x, y: y }],
+    data: [{ x: 0, y: y }, { x: currentItems.length - 1, y: y }],
+    parsing: false,
     borderColor: color,
     borderWidth: 1,
     borderDash: [4, 4],
@@ -732,11 +819,13 @@ function renderRsiPanel() {
   rsiChart = new Chart(el.rsiCanvas, {
     type: 'line',
     data: {
+      labels: currentLabels,
       datasets: [
         {
           type: 'line',
           label: 'RSI 14',
           data: pts('rsi14'),
+          parsing: false,
           borderColor: C_SMA50,
           borderWidth: 1.5,
           fill: false,
@@ -760,7 +849,7 @@ function renderRsiPanel() {
         tooltip: Object.assign({}, TOOLTIP_STYLE, {
           filter: function (item) { return item.datasetIndex < 1; },
           callbacks: {
-            title: function (items) { return items && items.length ? fmtTs(items[0].parsed.x) : ''; },
+            title: tooltipTitle,
             label: function (ctx) {
               var v = ctx.parsed.y;
               return 'RSI: ' + (v === null || v === undefined ? '—' : Number(v).toFixed(2));
@@ -769,7 +858,7 @@ function renderRsiPanel() {
         })
       },
       scales: {
-        x: timeScaleOpts(true),
+        x: xScaleOpts(currentLabels, true),
         y: {
           position: 'right',
           min: 0,
@@ -794,11 +883,13 @@ function renderMacdPanel() {
   macdChart = new Chart(el.macdCanvas, {
     type: 'bar',
     data: {
+      labels: currentLabels,
       datasets: [
         {
           type: 'bar',
           label: 'Hist',
           data: pts('macd_hist'),
+          parsing: false,
           backgroundColor: histColors,
           borderWidth: 0,
           barPercentage: 0.8,
@@ -809,6 +900,7 @@ function renderMacdPanel() {
           type: 'line',
           label: 'MACD',
           data: pts('macd'),
+          parsing: false,
           borderColor: C_EMA12,
           borderWidth: 1.4,
           fill: false,
@@ -822,6 +914,7 @@ function renderMacdPanel() {
           type: 'line',
           label: 'Signal',
           data: pts('macd_signal'),
+          parsing: false,
           borderColor: C_EMA26,
           borderWidth: 1.4,
           borderDash: [5, 3],
@@ -845,7 +938,7 @@ function renderMacdPanel() {
         legend: { display: false },
         tooltip: Object.assign({}, TOOLTIP_STYLE, {
           callbacks: {
-            title: function (items) { return items && items.length ? fmtTs(items[0].parsed.x) : ''; },
+            title: tooltipTitle,
             label: function (ctx) {
               var v = ctx.parsed.y;
               return ctx.dataset.label + ': ' + (v === null || v === undefined ? '—' : Number(v).toFixed(3));
@@ -854,7 +947,7 @@ function renderMacdPanel() {
         })
       },
       scales: {
-        x: timeScaleOpts(false),
+        x: xScaleOpts(currentLabels, false),
         y: {
           position: 'right',
           grid: { color: 'rgba(139,148,158,0.10)' },
@@ -866,20 +959,26 @@ function renderMacdPanel() {
   });
 }
 
-/* ---------- Cross-chart hover sync (index-aligned time axes) ---------- */
+/* ---------- Cross-chart hover sync (index-aligned category axes) ---------- */
 function syncHover(active) {
   var i = -1;
   if (active && active.length) { i = active[0].index; }
   if (i === lastHoverIndex) { return; }
   lastHoverIndex = i;
 
-  [volumeChart, rsiChart, macdChart].forEach(function (ch) {
+  [chart, volumeChart, rsiChart, macdChart].forEach(function (ch) {
     if (!ch) { return; }
     try {
       if (i < 0) {
         ch.clearActiveElements();
+        if (ch.tooltip) { ch.tooltip.setActiveElements([], {}); }
       } else {
+        var el = ch.getDatasetMeta(0) && ch.getDatasetMeta(0).data[i];
+        var pos = (el && typeof el.getCenterPoint === 'function') ? el.getCenterPoint() : {};
         ch.setActiveElements([{ datasetIndex: 0, index: i }]);
+        // The financial plugin's hover override breaks the tooltip's own event
+        // path (tooltip._active never fills) — force it from the synced index.
+        if (ch.tooltip) { ch.tooltip.setActiveElements([{ datasetIndex: 0, index: i }], pos); }
       }
       ch.update('none');
     } catch (e) { /* cosmetic only */ }
