@@ -101,3 +101,46 @@ CREATE TABLE IF NOT EXISTS equity_curve (
     strategy         TEXT DEFAULT 'paper-v1',
     created_at       TIMESTAMPTZ DEFAULT now()
 );
+
+-- Decision log (Phase 5): FULL context of every trade the bot considered —
+-- the training set for the NEXT model generation. Every row = one decision
+-- with the exact features the bot saw at that moment, the LLM's final 0-1
+-- rating, whether it executed, and the trade link (join trades.pnl later).
+CREATE TABLE IF NOT EXISTS trade_decisions (
+    id               BIGSERIAL PRIMARY KEY,
+    decision_ts      TIMESTAMPTZ DEFAULT now(),
+    symbol           TEXT NOT NULL,
+    action           TEXT,                          -- BUY / SELL / HOLD / SKIP
+    price            DOUBLE PRECISION,              -- reference/execution price
+    qty              INTEGER,
+    -- ranking inputs (the bot's own math)
+    composite_score  DOUBLE PRECISION,              -- 0.4*mom + 0.35*ml + 0.25*sent
+    mom_rank         DOUBLE PRECISION,
+    ml_p_up          DOUBLE PRECISION,
+    sent_3d          DOUBLE PRECISION,
+    sent_7d          DOUBLE PRECISION,
+    -- market context (the regime gate)
+    market_sentiment DOUBLE PRECISION,
+    global_cues      DOUBLE PRECISION,
+    regime_score     DOUBLE PRECISION,
+    regime_risk_on   BOOLEAN,
+    -- technical snapshot at decision time
+    rsi14            DOUBLE PRECISION,
+    macd             DOUBLE PRECISION,
+    bb_pos           DOUBLE PRECISION,
+    atr14            DOUBLE PRECISION,
+    ret_1            DOUBLE PRECISION,
+    ret_5            DOUBLE PRECISION,
+    ret_21           DOUBLE PRECISION,
+    vol_z            DOUBLE PRECISION,
+    -- LLM rating gate
+    llm_rating       DOUBLE PRECISION,              -- final 0..1 from the LLM
+    llm_reason       TEXT,                          -- one-line reasoning
+    llm_model        TEXT,
+    llm_gate_pass    BOOLEAN,                       -- rating >= threshold
+    -- outcome
+    executed         BOOLEAN DEFAULT FALSE,         -- did the bot actually fill it
+    trade_id         BIGINT,                        -- -> trades.id (join for pnl)
+    UNIQUE (symbol, decision_ts)
+);
+CREATE INDEX IF NOT EXISTS idx_trade_decisions_symbol ON trade_decisions (symbol, decision_ts DESC);

@@ -24,6 +24,7 @@ from pathlib import Path
 import psycopg2
 
 from analysis.engine import FeeSchedule
+from bot.llm_gate import LLM_MIN_RATING, build_context, llm_rate, log_decision
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PICKS_PATH = REPO_ROOT / "data" / "signals" / "nextday_picks.json"
@@ -128,14 +129,17 @@ def _last_close(symbol: str) -> float:
 
 def record_fill(side: str, symbol: str, qty: int, price: float, fees: float,
                 position_id: str, exit_reason: str | None = None,
-                pnl: float | None = None, pnl_pct: float | None = None) -> None:
+                pnl: float | None = None, pnl_pct: float | None = None) -> int:
     with db() as conn, conn.cursor() as cur:
         cur.execute("""
             INSERT INTO trades (symbol, side, qty, price, ts, strategy, status,
                                 position_id, fees, pnl, pnl_pct, exit_reason)
             VALUES (%s, %s, %s, %s, now(), %s, 'paper', %s, %s, %s, %s, %s)
+            RETURNING id
         """, (symbol, side, qty, price, STRATEGY, position_id, fees, pnl, pnl_pct, exit_reason))
+        trade_id = cur.fetchone()[0]
         conn.commit()
+    return trade_id
 
 
 def cmd_execute() -> int:
@@ -183,9 +187,12 @@ def cmd_execute() -> int:
         notional = pos["qty"] * px
         fee = FEES.exit_fee(notional)
         pnl = (px - pos["price"]) * pos["qty"] - pos["fees"] - fee
-        record_fill("SELL", sym, pos["qty"], px, fee, pos["position_id"],
-                    exit_reason="signal", pnl=round(pnl, 2),
-                    pnl_pct=round(pnl / (pos["qty"] * pos["price"]), 4))
+        trade_id = record_fill("SELL", sym, pos["qty"], px, fee, pos["position_id"],
+                               exit_reason="signal", pnl=round(pnl, 2),
+                               pnl_pct=round(pnl / (pos["qty"] * pos["price"]), 4))
+        ctx = build_context(sym, "SELL", px, pos["qty"], None, regime)
+        with db() as conn:
+            log_decision(conn, ctx, (None, None, None), True, True, trade_id)
         print(f"[bot] SELL {sym} x{pos['qty']} @ {px:.2f} (pnl {pnl:+.2f})")
 
     # buys: fill free top-N slots (equal weight of CURRENT equity)
@@ -193,9 +200,6 @@ def cmd_execute() -> int:
     held = {p["symbol"]: p for p in positions}
     free = TOP_N - len(held)
     if free > 0:
-        with db() as conn, conn.cursor() as cur:
-            cur.execute("SELECT COALESCE(SUM(qty*price),0) FROM trades WHERE side='BUY' AND status='paper'")
-            # equity = cash + holdings; approximate via capital - spent + pnl
         equity = _portfolio_equity()
         per = WEIGHT * equity
         bought = 0
@@ -212,10 +216,31 @@ def cmd_execute() -> int:
                 continue
             notional = qty * px
             fee = FEES.entry_fee(notional)
+            ctx = build_context(p["symbol"], "BUY", px, qty, p, regime)
+            with db() as conn:
+                dec_id = log_decision(conn, ctx, (None, None, None), False, False)
+            # ---- LLM final rating gate ----
+            rating, reason, model = llm_rate(ctx)
+            gate_pass = rating is not None and rating >= llm_gate.LLM_MIN_RATING
+            with db() as conn:
+                cur = conn.cursor()
+                cur.execute("""UPDATE trade_decisions SET llm_rating=%s, llm_reason=%s,
+                               llm_model=%s, llm_gate_pass=%s WHERE id=%s""",
+                            (rating, reason, model, gate_pass, dec_id))
+                conn.commit()
+            if not gate_pass:
+                print(f"[bot] SKIP {p['symbol']} — LLM rating {rating} (< {llm_gate.LLM_MIN_RATING})"
+                      + (f" — {reason}" if reason else ""))
+                continue
             pid = str(uuid.uuid4())[:8]
-            record_fill("BUY", p["symbol"], qty, px, fee, pid)
+            trade_id = record_fill("BUY", p["symbol"], qty, px, fee, pid)
+            with db() as conn:
+                cur = conn.cursor()
+                cur.execute("UPDATE trade_decisions SET executed=TRUE, trade_id=%s WHERE id=%s",
+                            (trade_id, dec_id))
+                conn.commit()
             print(f"[bot] BUY {p['symbol']} x{qty} @ {px:.2f} (composite {p['composite']:.3f}, "
-                  f"sent {p['sent_3d']:+.3f}, rank {p['rank']})")
+                  f"sent {p['sent_3d']:+.3f}, LLM {rating})")
             bought += 1
     print(f"[bot] executed (fallback prices: {used_fallback})")
     return 0
