@@ -45,12 +45,43 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_news_url ON news_sentiment (url);
 
 -- Paper trades (Phase 5)
 CREATE TABLE IF NOT EXISTS trades (
-    id       BIGSERIAL PRIMARY KEY,
-    symbol   TEXT NOT NULL,
-    side     TEXT NOT NULL,                    -- BUY / SELL
-    qty      INTEGER,
-    price    DOUBLE PRECISION,
-    ts       TIMESTAMPTZ DEFAULT now(),
-    strategy TEXT,
-    status   TEXT DEFAULT 'paper'
+    id            BIGSERIAL PRIMARY KEY,
+    symbol        TEXT NOT NULL,
+    side          TEXT NOT NULL,                    -- BUY / SELL
+    qty           INTEGER,
+    price         DOUBLE PRECISION,
+    ts            TIMESTAMPTZ DEFAULT now(),
+    strategy      TEXT,
+    status        TEXT DEFAULT 'paper',
+    position_id   TEXT,                             -- links entry/exit fills of one position
+    fees          DOUBLE PRECISION DEFAULT 0,
+    pnl           DOUBLE PRECISION,                 -- realized pnl (exit fills)
+    pnl_pct       DOUBLE PRECISION,
+    exit_reason   TEXT                              -- signal / stop_loss / end_of_test
+);
+CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades (symbol, ts);
+
+-- Pre-market market-wide sentiment (Phase 4): the 8:30 IST daily direction call
+CREATE TABLE IF NOT EXISTS market_sentiment (
+    date             DATE PRIMARY KEY,
+    avg_compound     DOUBLE PRECISION,              -- mean compound across articles
+    n_articles       INTEGER,
+    n_positive       INTEGER,
+    n_negative       INTEGER,
+    direction        TEXT,                          -- BULLISH / NEUTRAL / BEARISH
+    created_at       TIMESTAMPTZ DEFAULT now()
+);
+
+-- Global cues / geopolitics (Phase 4): SEPARATE attribute — US markets, Fed,
+-- crude, USD/INR, geo-risk. Feeds the paper bot's market-regime risk gate
+-- alongside market_sentiment (60/40 weighted, tweakable).
+CREATE TABLE IF NOT EXISTS global_cues (
+    date             DATE PRIMARY KEY,
+    avg_compound     DOUBLE PRECISION,              -- mean compound across all cue articles
+    n_articles       INTEGER,
+    n_positive       INTEGER,
+    n_negative       INTEGER,
+    direction        TEXT,                          -- BULLISH / NEUTRAL / BEARISH
+    themes           JSONB,                         -- {"crude": {avg, n}, "fed": {...}, "us_markets": {...}, "geo": {...}, "usd_inr": {...}}
+    created_at       TIMESTAMPTZ DEFAULT now()
 );

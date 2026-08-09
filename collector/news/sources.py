@@ -139,6 +139,46 @@ def fetch_google_news(symbol: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Global cues / geopolitics
+# ---------------------------------------------------------------------------
+# One Google News query per theme; each article carries a `theme` key so the
+# pipeline can bucket aggregates (crude / fed / us_markets / usd_inr / geo).
+GLOBAL_CUE_QUERIES: dict[str, str] = {
+    "crude": "crude oil price markets",
+    "fed": "US Federal Reserve rate decision",
+    "us_markets": "US stock market overnight global markets",
+    "usd_inr": "USD INR rupee dollar",
+    "geo": "geopolitical risk markets war",
+}
+
+
+def fetch_global_cues() -> list[dict]:
+    """Search Google News (last 24h) for each global-cue theme.
+
+    Returns uniform article dicts + a ``theme`` key for bucketing. Never
+    raises — any failing theme just yields nothing.
+    """
+    out: list[dict] = []
+    for theme, q in GLOBAL_CUE_QUERIES.items():
+        query = quote(q.replace(" ", "+"), safe="+")
+        url = config.GOOGLE_NEWS_URL.format(query=query)
+        resp = _get(url, "google")
+        if resp is None:
+            continue
+        for item in _rss_items(resp.text):
+            out.append(
+                {
+                    "title": item["title"],
+                    "url": item["url"],
+                    "published": item["published"],
+                    "source": "global_cues",
+                    "theme": theme,
+                }
+            )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Market RSS feeds
 # ---------------------------------------------------------------------------
 def fetch_market_feeds() -> list[dict]:

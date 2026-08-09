@@ -170,6 +170,139 @@ def cmd_today(mapper, scorer, store_mod, sources_mod, config_mod) -> int:
 
 
 # ---------------------------------------------------------------------------
+# premarket — the 8:30 IST market-direction call (Phase 4)
+# Same fetch/score/store as `today` PLUS a market-wide aggregate written to
+# market_sentiment(date). The paper bot reads this as its risk gate.
+# ---------------------------------------------------------------------------
+def cmd_premarket(mapper, scorer, store_mod, sources_mod, config_mod) -> int:
+    symbols = [s["symbol"] for s in list_symbols()]
+    logger.info("premarket: %d symbols, 24h news window", len(symbols))
+
+    google_articles: list[dict] = []
+    for sym in symbols:
+        try:
+            google_articles.extend(sources_mod.fetch_google_news(sym) or [])
+        except Exception:
+            logger.exception("google fetch failed for %s", sym)
+    feed_articles: list[dict] = []
+    try:
+        feeds = sources_mod.fetch_market_feeds() or []
+        feed_articles = list(feeds.values())[0] if isinstance(feeds, dict) else list(feeds)
+    except Exception:
+        logger.exception("market feed fetch failed")
+    reddit_articles: list[dict] = []
+    after = datetime.now(timezone.utc) - timedelta(seconds=86400)
+    for sub in config_mod.REDDIT_SUBREDDITS:
+        try:
+            reddit_articles.extend(sources_mod.fetch_reddit(sub, after=after.timestamp()) or [])
+        except Exception:
+            logger.exception("reddit fetch failed for %s", sub)
+
+    all_articles = google_articles + feed_articles + reddit_articles
+    rows = [r for r in (_process(a, mapper, scorer) for a in all_articles) if r]
+    stored = _safe_store(store_mod, rows)
+
+    compounds = [r["sentiment_compound"] for r in rows if r["sentiment_compound"] is not None]
+    n_pos = sum(1 for c in compounds if c and c > 0.1)
+    n_neg = sum(1 for c in compounds if c and c < -0.1)
+    avg = (sum(compounds) / len(compounds)) if compounds else 0.0
+    direction = "BULLISH" if avg >= 0.1 else ("BEARISH" if avg <= -0.1 else "NEUTRAL")
+
+    # per-symbol aggregates (for the top-mover callout)
+    sym_avg: dict[str, float] = {}
+    for r in rows:
+        if r.get("symbol") and r["sentiment_compound"] is not None:
+            sym_avg.setdefault(r["symbol"], []).append(r["sentiment_compound"])  # type: ignore[arg-type]
+    sym_avg = {k: sum(v) / len(v) for k, v in sym_avg.items()}  # type: ignore[arg-type]
+
+    today = datetime.now(timezone.utc).date()
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO market_sentiment (date, avg_compound, n_articles, n_positive, n_negative, direction)
+               VALUES (%s, %s, %s, %s, %s, %s)
+               ON CONFLICT (date) DO UPDATE SET avg_compound=EXCLUDED.avg_compound,
+                 n_articles=EXCLUDED.n_articles, n_positive=EXCLUDED.n_positive,
+                 n_negative=EXCLUDED.n_negative, direction=EXCLUDED.direction,
+                 created_at=now()""",
+            (today, round(avg, 4), len(compounds), n_pos, n_neg, direction),
+        )
+        conn.commit()
+
+    top = sorted(sym_avg.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    bottom = sorted(sym_avg.items(), key=lambda kv: kv[1])[:5]
+    print("\n===== PRE-MARKET SENTIMENT CALL =====")
+    print(f"date        : {today} (IST)")
+    print(f"articles    : {len(compounds)} scored | pos {n_pos} / neg {n_neg}")
+    print(f"avg compound: {avg:+.3f}  ->  {direction}")
+    print("most bullish:", ", ".join(f"{s} ({v:+.2f})" for s, v in top) or "—")
+    print("most bearish:", ", ".join(f"{s} ({v:+.2f})" for s, v in bottom) or "—")
+    print("===================================\n")
+    return stored
+
+
+# ---------------------------------------------------------------------------
+# cues — global/geopolitical sentiment (SEPARATE attribute from market news).
+# Bucketed by theme (crude/fed/us_markets/usd_inr/geo) into global_cues; the
+# paper bot weights this against market_sentiment for its risk gate.
+# ---------------------------------------------------------------------------
+def cmd_cues(mapper, scorer, store_mod, sources_mod, config_mod) -> int:
+    articles = sources_mod.fetch_global_cues() or []
+    logger.info("cues: %d global-cue articles fetched", len(articles))
+
+    rows: list[dict] = []
+    for a in articles:
+        row = _process(a, mapper, scorer)
+        if row:
+            row["symbol"] = None            # cues are market-wide, never per-symbol
+            row["theme"] = a.get("theme")
+            rows.append(row)
+    stored = _safe_store(store_mod, rows)
+
+    theme_buckets: dict[str, dict] = {}
+    for r in rows:
+        theme = r.get("theme") or "other"
+        c = r["sentiment_compound"]
+        if c is None:
+            continue
+        b = theme_buckets.setdefault(theme, {"n": 0, "sum": 0.0})
+        b["n"] += 1
+        b["sum"] += c
+
+    all_c = [r["sentiment_compound"] for r in rows if r["sentiment_compound"] is not None]
+    n_pos = sum(1 for c in all_c if c > 0.1)
+    n_neg = sum(1 for c in all_c if c < -0.1)
+    avg = (sum(all_c) / len(all_c)) if all_c else 0.0
+    direction = "BULLISH" if avg >= 0.1 else ("BEARISH" if avg <= -0.1 else "NEUTRAL")
+
+    import json as _json
+    themes_json = _json.dumps(
+        {k: {"avg": round(v["sum"] / v["n"], 4), "n": v["n"]} for k, v in theme_buckets.items()}
+    )
+    today = datetime.now(timezone.utc).date()
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO global_cues (date, avg_compound, n_articles, n_positive, n_negative, direction, themes)
+               VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+               ON CONFLICT (date) DO UPDATE SET avg_compound=EXCLUDED.avg_compound,
+                 n_articles=EXCLUDED.n_articles, n_positive=EXCLUDED.n_positive,
+                 n_negative=EXCLUDED.n_negative, direction=EXCLUDED.direction,
+                 themes=EXCLUDED.themes, created_at=now()""",
+            (today, round(avg, 4), len(all_c), n_pos, n_neg, direction, themes_json),
+        )
+        conn.commit()
+
+    print("\n===== GLOBAL CUES CALL =====")
+    print(f"date        : {today} (IST)")
+    print(f"articles    : {len(all_c)} scored | pos {n_pos} / neg {n_neg}")
+    print(f"avg compound: {avg:+.3f}  ->  {direction}")
+    for theme, b in theme_buckets.items():
+        t_avg = b["sum"] / b["n"]
+        print(f"  {theme:10s}: {t_avg:+.3f}  ({b['n']} articles)")
+    print("=============================\n")
+    return stored
+
+
+# ---------------------------------------------------------------------------
 # backfill (GDELT)
 # ---------------------------------------------------------------------------
 def cmd_backfill(args, mapper, scorer, store_mod, sources_mod) -> int:
@@ -260,6 +393,8 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("today", help="google news + market feeds + reddit (24h), score, store")
+    sub.add_parser("premarket", help="today + market-wide aggregate -> market_sentiment (8:30 IST call)")
+    sub.add_parser("cues", help="global/geopolitical news (crude/fed/us_markets/usd_inr/geo) -> global_cues")
     bf = sub.add_parser("backfill", help="GDELT per-symbol backfill")
     bf.add_argument("--days", type=int, default=60, help="window length in days (default 60)")
     sub.add_parser("status", help="news_sentiment stats table")
@@ -277,6 +412,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "today":
         cmd_today(mapper, scorer, store, sources, config_mod)
+        return 0
+    if args.cmd == "premarket":
+        cmd_premarket(mapper, scorer, store, sources, config_mod)
+        return 0
+    if args.cmd == "cues":
+        cmd_cues(mapper, scorer, store, sources, config_mod)
         return 0
     if args.cmd == "backfill":
         cmd_backfill(args, mapper, scorer, store, sources)
