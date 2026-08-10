@@ -221,7 +221,7 @@ def cmd_execute() -> int:
                 dec_id = log_decision(conn, ctx, (None, None, None), False, False)
             # ---- LLM final rating gate ----
             rating, reason, model = llm_rate(ctx)
-            gate_pass = rating is not None and rating >= llm_gate.LLM_MIN_RATING
+            gate_pass = rating is not None and rating >= LLM_MIN_RATING
             with db() as conn:
                 cur = conn.cursor()
                 cur.execute("""UPDATE trade_decisions SET llm_rating=%s, llm_reason=%s,
@@ -229,7 +229,7 @@ def cmd_execute() -> int:
                             (rating, reason, model, gate_pass, dec_id))
                 conn.commit()
             if not gate_pass:
-                print(f"[bot] SKIP {p['symbol']} — LLM rating {rating} (< {llm_gate.LLM_MIN_RATING})"
+                print(f"[bot] SKIP {p['symbol']} — LLM rating {rating} (< {LLM_MIN_RATING})"
                       + (f" — {reason}" if reason else ""))
                 continue
             pid = str(uuid.uuid4())[:8]
