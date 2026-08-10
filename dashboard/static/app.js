@@ -1,21 +1,33 @@
 /* ==========================================================================
    NSE Quant — Dashboard frontend (vanilla JS, no build step)
-   Consumes the FastAPI JSON contract:
+   4-page hash-routed app: #/portfolio · #/charts · #/architecture · #/data
+
+   API contract:
      GET /api/health        -> {status, db_ok, market_open, candles_total}
      GET /api/symbols       -> {symbols: [{symbol, name, instrument_type}]}
-     GET /api/candles?symbol=&timeframe=&days=&from=&to=
+     GET /api/candles?symbol=&timeframe=&days=&limit=
                              -> {symbol, timeframe, candles:[{ts, open, high,
-                                low, close, volume}]} (ts ASC; from/to
-                                YYYY-MM-DD inclusive, wins over days)
-     GET /api/indicators?symbol=&timeframe=&days=&from=&to=
+                                low, close, volume}]} (ts ASC)
+     GET /api/indicators?symbol=&timeframe=&days=&limit=
                              -> same candles + sma20, sma50, ema12, ema26,
                                 rsi14, macd, macd_signal, macd_hist,
                                 bb_upper, bb_mid, bb_lower, vol_sma20
-                                (indicator fields are null during warmup)
      GET /api/movers?n=     -> {gainers:[...], losers:[...]}
-     GET /api/portfolio     -> {summary:{...}, positions:[]}
-     GET /api/sentiment?symbol= -> {rows:[{title, url, source,
-                               published_at, sentiment_compound, ...}]}
+     GET /api/portfolio     -> {summary:{...}, positions:[{symbol,qty,invested}]}
+     GET /api/recent-trades?limit=N -> {trades:[{trade_id, symbol, side, qty,
+                                price, ts, fees, pnl, pnl_pct, exit_reason,
+                                position_id, composite_score, mom_rank,
+                                ml_p_up, sent_3d, market_sentiment,
+                                global_cues, regime_score, regime_risk_on,
+                                rsi14, macd, bb_pos, atr14, ret_1, ret_5,
+                                ret_21, llm_rating, llm_reason, llm_model}]}
+     GET /api/market       -> {market_sentiment:{direction, avg_compound,
+                                n_articles,...}, global_cues:{..., themes:{}},
+                                equity:{date, equity, cash, benchmark}}
+     GET /api/equity       -> {points:[{date, equity, cash, benchmark}]}
+     GET /api/sentiment?symbol= -> {rows:[...]}
+     GET /api/raw?table=&limit=  -> {table, columns:[{column_name,data_type}],
+                                rows:[{}]}
    ========================================================================== */
 'use strict';
 
@@ -37,21 +49,27 @@ var API = {
   indicators: '/api/indicators',
   movers: '/api/movers',
   portfolio: '/api/portfolio',
-  sentiment: '/api/sentiment'
+  recentTrades: '/api/recent-trades',
+  market: '/api/market',
+  equity: '/api/equity',
+  sentiment: '/api/sentiment',
+  raw: '/api/raw'
 };
 
 var DEFAULT_SYMBOL = 'TCS';
 var DEFAULT_TIMEFRAME = '1d';
-var REFRESH_MS = 60 * 1000;      // silent auto-refresh of movers + status chip
+var REFRESH_MS = 60 * 1000;      // silent auto-refresh of side panels + status chip
 var MAX_POINTS = 2500;           // downsample above this (bucketing)
 
-// Date-range presets (months back from today, local tz). MAX = everything
-// the backend has for the timeframe (requested via limit=5000, no from/to).
-var PRESETS = { '1M': 1, '3M': 3, '6M': 6 };
-var PRESET_KEYS = ['1M', '3M', '6M', 'MAX'];
-var DEFAULT_PRESET_BY_TF = { '1d': '6M', '15m': '3M', '5m': '1M' };
-var MAX_FETCH_LIMIT = 5000;      // backend cap for the MAX preset
+// Default lookback windows per timeframe (no user date-range controls).
+var DAYS_BY_TF = { '1d': 180, '15m': 90, '5m': 30 };   // 6M / 3M / 1M
 var TF_LABEL = { '1d': '1D', '15m': '15M', '5m': '5M' };
+
+// Whitelisted tables for the raw data viewer (/api/raw).
+var RAW_TABLES = [
+  'trades', 'trade_decisions', 'news_sentiment', 'market_sentiment',
+  'global_cues', 'equity_curve', 'symbols', 'candles_1d'
+];
 
 // Indicator fields carried on /api/indicators candles.
 var IND_FIELDS = [
@@ -75,6 +93,7 @@ var chart = null;
 var volumeChart = null;
 var rsiChart = null;
 var macdChart = null;
+var equityChart = null;
 
 var symbols = [];
 var currentSymbol = DEFAULT_SYMBOL;
@@ -84,15 +103,15 @@ var currentLabels = [];      // per-candle x-axis labels (category scale, index-
 var hasIndicators = false;   // true when the indicators feed is available
 var indicatorsState = { sma20: true, sma50: true, ema: false, bb: false };
 
-// Active chart date range. preset is '1M'|'3M'|'6M'|'MAX' or null for custom.
-var currentRange = { from: null, to: null };   // resolved YYYY-MM-DD bounds
-var activePreset = null;                       // preset key currently in effect
-var presetTouched = false;                     // true once user picks preset/custom
-
 var loadSeq = 0;             // guards against out-of-order candle responses
 var sentimentSeq = 0;        // guards out-of-order sentiment responses
 var statusTimer = null;
 var lastHoverIndex = -1;
+var lastCloseCache = {};     // symbol -> last daily close (for position P&L)
+
+var chartsInit = false;      // charts page lazy-init flag
+var portfolioInit = false;   // portfolio page lazy-init flag
+var dataInit = false;        // data page lazy-init flag
 
 /* ---------- DOM ---------- */
 function $(sel) { return document.querySelector(sel); }
@@ -101,25 +120,7 @@ var el = {
   marketChip: $('#market-chip'),
   candlesTotal: $('#candles-total'),
   lastUpdated: $('#last-updated'),
-  symbolSelect: $('#symbol-select'),
-  chartTitle: $('#chart-title'),
-  chartRange: $('#chart-range'),
-  chartCanvas: $('#candle-chart'),
-  volumeCanvas: $('#volume-chart'),
-  rsiCanvas: $('#rsi-chart'),
-  macdCanvas: $('#macd-chart'),
-  statusMsg: $('#status-msg'),
-  gainers: $('#gainers-list'),
-  losers: $('#losers-list'),
-  portfolioBody: $('#portfolio-body'),
-  sentimentBody: $('#sentiment-body'),
-  sentimentSymbol: $('#sentiment-symbol'),
-  tfButtons: Array.prototype.slice.call(document.querySelectorAll('.tf-btn')),
-  indChips: Array.prototype.slice.call(document.querySelectorAll('.ind-chip')),
-  presetBtns: Array.prototype.slice.call(document.querySelectorAll('.preset-btn')),
-  fromDate: $('#from-date'),
-  toDate: $('#to-date'),
-  applyRangeBtn: $('#apply-range')
+  statusMsg: $('#status-msg')
 };
 
 /* ---------- Chart.js setup ---------- */
@@ -145,8 +146,6 @@ function setupChartDefaults() {
     };
     FinCtl.prototype.__candleTooltipFix = true;
   }
-  // chartjs-adapter-luxon auto-registers on load; explicit register is a
-  // no-op if already registered but guards against CDN variants that don't.
   if (window.chartjsAdapterLuxon) {
     Chart.register(window.chartjsAdapterLuxon);
   }
@@ -163,7 +162,6 @@ function esc(s) {
   });
 }
 
-// DOM builder — textContent everywhere, no unescaped innerHTML.
 function mkEl(tag, className, text) {
   var e = document.createElement(tag);
   if (className) { e.className = className; }
@@ -171,10 +169,6 @@ function mkEl(tag, className, text) {
   return e;
 }
 
-// chartjs-chart-financial sets parsing:false on the whole chart, so every
-// dataset item is used as-is ({x, o, h, l, c} / {x, y}); x is the candle's
-// ARRAY INDEX (category scale) while the epoch-ms timestamp lives on the
-// parallel currentItems[i].x (tooltips / range meta resolve through it).
 function toMs(ts) {
   if (typeof ts === 'number') { return ts; }
   if (window.luxon && luxon.DateTime) {
@@ -246,6 +240,25 @@ function fmtWinRate(v) {
   return n.toFixed(1) + '%';
 }
 
+// Numeric with fixed decimals; null/undefined/NaN -> '—'
+function fmtNum(v, d) {
+  var n = Number(v);
+  if (v === null || v === undefined || !isFinite(n)) { return '—'; }
+  return n.toFixed(d === undefined ? 2 : d);
+}
+
+// Signed numeric (P&L-style), '—' on null
+function fmtSigned(v, d) {
+  var n = Number(v);
+  if (v === null || v === undefined || !isFinite(n)) { return '—'; }
+  return (n >= 0 ? '+' : '') + n.toFixed(d === undefined ? 2 : d);
+}
+
+function fmtBool(v) {
+  if (v === null || v === undefined) { return '—'; }
+  return v ? 'Yes' : 'No';
+}
+
 function touchUpdated() {
   el.lastUpdated.textContent = 'Updated ' + new Date().toLocaleTimeString('en-IN');
 }
@@ -257,76 +270,6 @@ function showToast(msg, isError) {
   statusTimer = setTimeout(function () {
     el.statusMsg.classList.remove('show');
   }, isError ? 6000 : 2500);
-}
-
-/* ---------- Date range ---------- */
-function pad2(n) { return (n < 10 ? '0' : '') + n; }
-
-// Local-timezone YYYY-MM-DD (never toISOString: that is UTC).
-function toDateStr(d) {
-  return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
-}
-
-// Resolved from/to (YYYY-MM-DD) for a preset key, relative to today (local tz).
-function presetDates(key) {
-  if (key === 'MAX') { return { from: null, to: null }; }
-  var today = new Date();
-  today.setHours(0, 0, 0, 0);
-  var from = new Date(today);
-  from.setMonth(from.getMonth() - PRESETS[key]);
-  return { from: toDateStr(from), to: toDateStr(today) };
-}
-
-// Set the active preset without reloading (keeps the UI in sync).
-function setPreset(key) {
-  activePreset = key;
-  var d = presetDates(key);
-  currentRange = { from: d.from, to: d.to };
-  syncRangeUI();
-}
-
-function applyPreset(key) {
-  setPreset(key);
-  presetTouched = true;
-  loadChart();
-}
-
-function applyCustomRange() {
-  var from = el.fromDate.value || null;
-  var to = el.toDate.value || null;
-  if (!from && !to) {
-    showToast('Pick at least one of From / To', true);
-    return;
-  }
-  if (from && to && from > to) {
-    var t = from; from = to; to = t;
-    el.fromDate.value = from;
-    el.toDate.value = to;
-    showToast('From was after To — swapped', false);
-  }
-  activePreset = null;
-  currentRange = { from: from, to: to };
-  presetTouched = true;
-  syncRangeUI();
-  loadChart();
-}
-
-function syncRangeUI() {
-  el.presetBtns.forEach(function (b) {
-    b.classList.toggle('active', b.getAttribute('data-preset') === activePreset);
-  });
-  el.fromDate.value = currentRange.from || '';
-  el.toDate.value = currentRange.to || '';
-}
-
-// Query params for the current range. Presets (except MAX) and custom ranges
-// use from/to; MAX asks the backend for its full limit without from/to.
-function rangeParams() {
-  if (activePreset === 'MAX') { return 'limit=' + MAX_FETCH_LIMIT; }
-  var p = [];
-  if (currentRange.from) { p.push('from=' + encodeURIComponent(currentRange.from)); }
-  if (currentRange.to) { p.push('to=' + encodeURIComponent(currentRange.to)); }
-  return p.join('&');
 }
 
 /* ---------- API ---------- */
@@ -361,6 +304,524 @@ function setMarketChip(open) {
   chip.appendChild(document.createTextNode(label));
 }
 
+/* ==========================================================================
+   HASH ROUTER
+   ========================================================================== */
+var ROUTES = ['portfolio', 'charts', 'architecture', 'data'];
+
+function currentRoute() {
+  var h = (location.hash || '').replace(/^#\/?/, '');
+  return ROUTES.indexOf(h) >= 0 ? h : 'portfolio';
+}
+
+function showPage(route) {
+  ROUTES.forEach(function (r) {
+    var page = document.getElementById('page-' + r);
+    if (page) { page.classList.toggle('active', r === route); }
+  });
+  document.querySelectorAll('.nav-link').forEach(function (a) {
+    a.classList.toggle('active', a.getAttribute('data-route') === route);
+  });
+}
+
+function route() {
+  var r = currentRoute();
+  showPage(r);
+
+  // Lazy page init — charts must only build while visible (hidden canvases
+  // render at 0x0); portfolio/data initialize on first visit.
+  if (r === 'portfolio') {
+    if (!portfolioInit) { portfolioInit = true; initPortfolio(); }
+    else { refreshPortfolio(); }
+  }
+  if (r === 'charts') {
+    if (!chartsInit) { chartsInit = true; initCharts(); }
+    else { resizeAllCharts(); }
+  }
+  if (r === 'data') {
+    if (!dataInit) { dataInit = true; initDataPage(); }
+    else { loadRaw(); }
+  }
+}
+
+/* ==========================================================================
+   PAGE 1 · PORTFOLIO
+   ========================================================================== */
+function initPortfolio() {
+  loadEquityChart();
+  loadMarket();
+  loadPositions();
+  loadRecentTrades();
+}
+
+function refreshPortfolio() {
+  loadEquityChart();
+  loadMarket();
+  loadPositions();
+}
+
+/* ---------- Equity vs benchmark chart ---------- */
+function loadEquityChart() {
+  fetchJson(API.equity).then(function (d) {
+    var pts = Array.isArray(d.points) ? d.points : [];
+    if (pts.length <= 1) {
+      // empty state — needs at least 2 points to draw a curve
+      var wrap = $('#equity-chart-wrap'), empty = $('#equity-empty');
+      if (wrap) { wrap.style.display = 'none'; }
+      if (empty) { empty.style.display = ''; }
+      if (equityChart) { equityChart.destroy(); equityChart = null; }
+      return;
+    }
+    var empty = $('#equity-empty');
+    if (empty) { empty.style.display = 'none'; }
+    var wrap = $('#equity-chart-wrap');
+    if (wrap) { wrap.style.display = ''; }
+    renderEquityChart(pts);
+  }).catch(function (err) {
+    showToast('Failed to load equity curve: ' + err.message, true);
+  });
+}
+
+function renderEquityChart(pts) {
+  var canvas = $('#equity-chart');
+  if (!canvas || !window.Chart) { return; }
+  if (equityChart) { equityChart.destroy(); equityChart = null; }
+
+  var labels = pts.map(function (p) { return fmtDay(p.date); });
+  var eq = pts.map(function (p, i) { return { x: i, y: Number(p.equity) }; });
+  var bm = pts.map(function (p, i) { return { x: i, y: Number(p.benchmark) }; });
+
+  equityChart = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: [
+        {
+          label: 'Paper equity',
+          data: eq,
+          parsing: false,
+          borderColor: UP,
+          backgroundColor: 'rgba(63,185,80,0.08)',
+          fill: true,
+          tension: 0.25,
+          borderWidth: 2,
+          pointRadius: 0,
+          pointHoverRadius: 3,
+          pointHitRadius: 6,
+          order: 1
+        },
+        {
+          label: 'Benchmark',
+          data: bm,
+          parsing: false,
+          borderColor: C_EMA12,
+          borderDash: [6, 4],
+          fill: false,
+          tension: 0.25,
+          borderWidth: 1.6,
+          pointRadius: 0,
+          pointHoverRadius: 3,
+          pointHitRadius: 6,
+          order: 2
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 250 },
+      interaction: { mode: 'index', intersect: false },
+      hover: { mode: 'index', intersect: false },
+      plugins: {
+        legend: {
+          display: true,
+          position: 'top',
+          align: 'end',
+          labels: { color: '#8b949e', boxWidth: 14, font: { size: 11 } }
+        },
+        tooltip: Object.assign({}, TOOLTIP_STYLE, {
+          callbacks: {
+            title: function (items) {
+              var idx = items && items.length ? items[0].dataIndex : -1;
+              return (idx >= 0 && idx < pts.length) ? fmtTs(pts[idx].date) : '';
+            },
+            label: function (ctx) {
+              var v = ctx.parsed && ctx.parsed.y;
+              return ctx.dataset.label + ': ₹' + (v === null || v === undefined ? '—' : Number(v).toLocaleString('en-IN', { maximumFractionDigits: 2 }));
+            }
+          }
+        })
+      },
+      scales: {
+        x: {
+          type: 'category',
+          grid: { color: 'rgba(139,148,158,0.10)' },
+          border: { color: '#30363d' },
+          ticks: { color: '#8b949e', maxRotation: 0, autoSkip: true, maxTicksLimit: 8, font: { size: 9 } }
+        },
+        y: {
+          position: 'right',
+          grid: { color: 'rgba(139,148,158,0.12)' },
+          border: { color: '#30363d' },
+          ticks: { color: '#8b949e', callback: function (v) { return '₹' + Number(v).toLocaleString('en-IN'); } }
+        }
+      }
+    }
+  });
+}
+
+/* ---------- Market pulse (sentiment + global cues + equity snap) ---------- */
+function loadMarket() {
+  fetchJson(API.market).then(function (d) {
+    renderMarket(d);
+  }).catch(function (err) {
+    var body = $('#market-body');
+    if (body) {
+      body.textContent = '';
+      body.appendChild(emptyState('📊', 'Market data unavailable', err.message));
+    }
+  });
+}
+
+function dirClass(direction) {
+  var d = String(direction || '').toUpperCase();
+  if (d === 'BULLISH') { return 'bullish'; }
+  if (d === 'BEARISH') { return 'bearish'; }
+  return 'neutral';
+}
+
+function marketCard(title, m) {
+  var card = mkEl('div', 'market-card');
+  var head = mkEl('div', 'market-card-head');
+  head.appendChild(mkEl('span', 'market-card-title', title));
+  head.appendChild(mkEl('span', 'direction-badge ' + dirClass(m.direction), m.direction || '—'));
+  card.appendChild(head);
+
+  var stats = mkEl('div', 'market-stats');
+  stats.appendChild(marketStat('Avg compound', fmtSigned(m.avg_compound, 3)));
+  stats.appendChild(marketStat('Articles', fmtInt(m.n_articles)));
+  stats.appendChild(marketStat('Pos / Neg', '<span class="pos">' + fmtInt(m.n_positive) + '</span> / <span class="neg">' + fmtInt(m.n_negative) + '</span>', true));
+  card.appendChild(stats);
+  return card;
+}
+
+function marketStat(k, v, isHtml) {
+  var s = mkEl('div', 'market-stat');
+  s.appendChild(mkEl('div', 'market-stat-k', k));
+  var vEl = mkEl('div', 'market-stat-v');
+  if (isHtml) { vEl.innerHTML = v; } else { vEl.textContent = v; }
+  s.appendChild(vEl);
+  return s;
+}
+
+function themeChip(key, t) {
+  var chip = mkEl('span', 'theme-chip');
+  chip.appendChild(mkEl('span', 'theme-name', key.replace('_', ' ')));
+  var avg = Number(t.avg);
+  chip.appendChild(mkEl('span', 'theme-avg ' + (isFinite(avg) ? (avg >= 0 ? 'pos' : 'neg') : ''), fmtSigned(avg, 3)));
+  chip.appendChild(mkEl('span', 'theme-n', 'n=' + fmtInt(t.n)));
+  return chip;
+}
+
+function renderMarket(d) {
+  var body = $('#market-body');
+  if (!body) { return; }
+  body.textContent = '';
+
+  var grid = mkEl('div', 'market-grid');
+  var ms = (d && d.market_sentiment) || {};
+  var gc = (d && d.global_cues) || {};
+
+  grid.appendChild(marketCard('Market sentiment', ms));
+
+  var gcCard = marketCard('Global cues', gc);
+  var themes = (gc && gc.themes && typeof gc.themes === 'object') ? gc.themes : {};
+  var themeKeys = Object.keys(themes).filter(function (k) { return themes[k] && typeof themes[k] === 'object'; });
+  if (themeKeys.length) {
+    var chips = mkEl('div', 'theme-chips');
+    themeKeys.forEach(function (k) { chips.appendChild(themeChip(k, themes[k])); });
+    gcCard.appendChild(chips);
+  }
+  grid.appendChild(gcCard);
+
+  var eq = (d && d.equity) || {};
+  if (eq && (eq.equity !== undefined || eq.benchmark !== undefined)) {
+    var snap = mkEl('div', 'equity-snap');
+    snap.appendChild(mkEl('span', null, 'Paper ₹' + fmtNum(eq.equity)));
+    snap.appendChild(mkEl('span', null, 'Benchmark ₹' + fmtNum(eq.benchmark)));
+    snap.appendChild(mkEl('span', null, String(eq.strategy || '')));
+    grid.appendChild(snap);
+  }
+
+  body.appendChild(grid);
+}
+
+/* ---------- Open positions (with live last close) ---------- */
+function fetchLastClose(sym) {
+  if (lastCloseCache[sym] !== undefined) {
+    return Promise.resolve(lastCloseCache[sym]);
+  }
+  return fetchJson(API.candles + '?symbol=' + encodeURIComponent(sym) + '&timeframe=1d&limit=1')
+    .then(function (d) {
+      var arr = (d && Array.isArray(d.candles)) ? d.candles : [];
+      var c = arr.length ? Number(arr[arr.length - 1].close) : null;
+      lastCloseCache[sym] = (isFinite(c) ? c : null);
+      return lastCloseCache[sym];
+    }).catch(function () {
+      lastCloseCache[sym] = null;
+      return null;
+    });
+}
+
+function loadPositions() {
+  fetchJson(API.portfolio).then(function (d) {
+    var positions = (d && Array.isArray(d.positions)) ? d.positions : [];
+    if (!positions.length) {
+      var body = $('#positions-body');
+      if (body) {
+        body.textContent = '';
+        body.appendChild(emptyState('💼', 'No open positions', 'Paper-trade positions will appear here once the bot trades.'));
+      }
+      return;
+    }
+    Promise.all(positions.map(function (p) {
+      return fetchLastClose(p.symbol).then(function (close) {
+        return { p: p, close: close };
+      });
+    })).then(function (rows) { renderPositions(rows); });
+  }).catch(function (err) {
+    var body = $('#positions-body');
+    if (body) {
+      body.textContent = '';
+      body.appendChild(emptyState('💼', 'Positions unavailable', err.message));
+    }
+  });
+}
+
+function renderPositions(rows) {
+  var body = $('#positions-body');
+  if (!body) { return; }
+  body.textContent = '';
+
+  var tbl = mkEl('table', 'positions-table');
+  var thead = mkEl('thead');
+  var htr = mkEl('tr');
+  ['Symbol', 'Qty', 'Invested', 'Last close', 'Unrealized P&L', 'P&L %'].forEach(function (h, i) {
+    var th = mkEl('th', i >= 1 ? 'num' : '', h);
+    htr.appendChild(th);
+  });
+  thead.appendChild(htr);
+  tbl.appendChild(thead);
+
+  var tbody = mkEl('tbody');
+  rows.forEach(function (row) {
+    var p = row.p;
+    var invested = Number(p.invested);
+    var qty = Number(p.qty);
+    var close = row.close;
+    var tr = mkEl('tr');
+
+    tr.appendChild(mkEl('td', 'sym', p.symbol || '—'));
+    tr.appendChild(mkEl('td', 'num', fmtInt(qty)));
+
+    var invTd = mkEl('td', 'num', '₹' + fmtNum(invested));
+    tr.appendChild(invTd);
+
+    var closeTd = mkEl('td', 'num', close === null ? '—' : '₹' + fmtNum(close));
+    tr.appendChild(closeTd);
+
+    var pnlTd = mkEl('td', 'num');
+    var pnlCls = '';
+    if (close !== null && isFinite(invested) && isFinite(qty) && qty > 0) {
+      var pnl = close * qty - invested;
+      pnlCls = pnl >= 0 ? 'pos' : 'neg';
+      pnlTd.textContent = fmtMoney(pnl);
+    } else {
+      pnlTd.textContent = '—';
+    }
+    pnlTd.classList.add(pnlCls);
+    tr.appendChild(pnlTd);
+
+    var pctTd = mkEl('td', 'num');
+    if (close !== null && isFinite(invested) && invested > 0 && isFinite(qty) && qty > 0) {
+      var pct = (close * qty - invested) / invested * 100;
+      pctTd.textContent = fmtPct(pct);
+      pctTd.classList.add(pct >= 0 ? 'pos' : 'neg');
+    } else {
+      pctTd.textContent = '—';
+    }
+    tr.appendChild(pctTd);
+
+    tbody.appendChild(tr);
+  });
+  tbl.appendChild(tbody);
+  body.appendChild(tbl);
+}
+
+/* ---------- Last 10 trades with full decision log ---------- */
+function loadRecentTrades() {
+  fetchJson(API.recentTrades + '?limit=10').then(function (d) {
+    renderTrades((d && Array.isArray(d.trades)) ? d.trades : []);
+  }).catch(function (err) {
+    var body = $('#trades-body');
+    if (body) {
+      body.textContent = '';
+      body.appendChild(emptyState('🧾', 'Trades unavailable', err.message));
+    }
+  });
+}
+
+function fmtPrice(v) {
+  var n = Number(v);
+  if (!isFinite(n)) { return '—'; }
+  return '₹' + n.toLocaleString('en-IN', { maximumFractionDigits: 2, minimumFractionDigits: 2 });
+}
+
+function tradeHeader(t) {
+  var btn = mkEl('button', 'trade-header');
+  btn.type = 'button';
+  btn.setAttribute('aria-expanded', 'false');
+
+  btn.appendChild(mkEl('span', 'trade-sym', t.symbol || '—'));
+  var side = String(t.side || '').toUpperCase();
+  btn.appendChild(mkEl('span', 'side-badge ' + (side === 'SELL' ? 'sell' : 'buy'), side || '—'));
+  btn.appendChild(mkEl('span', 'trade-qty', fmtInt(t.qty) + ' @ ' + fmtPrice(t.price)));
+  btn.appendChild(mkEl('span', 'trade-time', fmtTs(t.ts)));
+
+  var pnl = Number(t.pnl);
+  if (t.pnl !== null && t.pnl !== undefined && isFinite(pnl)) {
+    var pnlEl = mkEl('span', 'trade-pnl ' + (pnl >= 0 ? 'pos' : 'neg'), fmtMoney(pnl) + ' (' + fmtPct(t.pnl_pct) + ')');
+    btn.appendChild(pnlEl);
+  }
+
+  btn.appendChild(mkEl('span', 'trade-chev', '▼'));
+  return btn;
+}
+
+// label, value renderer
+var DECISION_FIELDS = [
+  ['Composite', function (t) { return fmtNum(t.composite_score, 3); }],
+  ['ML P(up)', function (t) { return fmtNum(t.ml_p_up, 3); }],
+  ['Mom rank', function (t) { return fmtNum(t.mom_rank, 2); }],
+  ['Sent 3d', function (t) { return fmtSigned(t.sent_3d, 3); }],
+  ['Mkt sentiment', function (t) { return fmtSigned(t.market_sentiment, 3); }],
+  ['Global cues', function (t) { return fmtSigned(t.global_cues, 3); }],
+  ['Regime score', function (t) { return fmtNum(t.regime_score, 3); }],
+  ['Regime risk-on', function (t) { return fmtBool(t.regime_risk_on); }],
+  ['RSI 14', function (t) { return fmtNum(t.rsi14, 1); }],
+  ['MACD', function (t) { return fmtNum(t.macd, 2); }],
+  ['BB pos', function (t) { return fmtNum(t.bb_pos, 3); }],
+  ['ATR 14', function (t) { return fmtNum(t.atr14, 1); }],
+  ['Ret 1d', function (t) { return fmtPct(t.ret_1); }],
+  ['Ret 5d', function (t) { return fmtPct(t.ret_5); }],
+  ['Ret 21d', function (t) { return fmtPct(t.ret_21); }],
+  ['Fees', function (t) { return '₹' + fmtNum(t.fees); }],
+  ['Exit reason', function (t) { return t.exit_reason || '—'; }]
+];
+
+function tradeDetail(t) {
+  var detail = mkEl('div', 'trade-detail');
+
+  var grid = mkEl('div', 'decision-grid');
+  DECISION_FIELDS.forEach(function (f) {
+    var pair = mkEl('div', 'dg-pair');
+    pair.appendChild(mkEl('span', 'dg-label', f[0]));
+    pair.appendChild(mkEl('span', 'dg-value', f[1](t)));
+    grid.appendChild(pair);
+  });
+  detail.appendChild(grid);
+
+  var llmBox = mkEl('div', 'llm-box');
+  var rating = Number(t.llm_rating);
+  var row = mkEl('div', 'llm-row');
+  row.appendChild(mkEl('span', 'llm-label', 'LLM rating'));
+  var barWrap = mkEl('div', 'llm-bar-wrap');
+  var fill = mkEl('div', 'llm-bar-fill');
+  var pct = isFinite(rating) ? Math.max(0, Math.min(1, rating)) * 100 : 0;
+  fill.style.width = pct + '%';
+  if (isFinite(rating)) {
+    fill.className = 'llm-bar-fill ' + (rating >= 0.6 ? 'hi' : (rating >= 0.4 ? 'mid' : 'lo'));
+  }
+  barWrap.appendChild(fill);
+  row.appendChild(barWrap);
+  row.appendChild(mkEl('span', 'llm-val', isFinite(rating) ? rating.toFixed(2) : '—'));
+  llmBox.appendChild(row);
+
+  if (t.llm_reason) { llmBox.appendChild(mkEl('p', 'llm-reason', t.llm_reason)); }
+  if (t.llm_model) { llmBox.appendChild(mkEl('div', 'llm-model', t.llm_model)); }
+  detail.appendChild(llmBox);
+
+  return detail;
+}
+
+function renderTrades(trades) {
+  var body = $('#trades-body');
+  if (!body) { return; }
+  body.textContent = '';
+
+  var sub = $('#trades-sub');
+  if (sub) { sub.textContent = trades.length ? trades.length + ' of last 10 · full decision log' : '—'; }
+
+  if (!trades.length) {
+    body.appendChild(emptyState('🧾', 'No trades yet', 'Executed paper trades with their full decision log will show here.'));
+    return;
+  }
+
+  trades.forEach(function (t) {
+    var card = mkEl('div', 'trade-card');
+    var header = tradeHeader(t);
+    var detail = tradeDetail(t);
+    header.addEventListener('click', function () {
+      var open = card.classList.toggle('open');
+      header.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+    card.appendChild(header);
+    card.appendChild(detail);
+    body.appendChild(card);
+  });
+}
+
+/* ==========================================================================
+   PAGE 2 · CHARTS (existing chart page, no date-range controls)
+   ========================================================================== */
+var chartEl = null;
+
+function initCharts() {
+  chartEl = {
+    symbolSelect: $('#symbol-select'),
+    chartTitle: $('#chart-title'),
+    chartRange: $('#chart-range'),
+    chartCanvas: $('#candle-chart'),
+    volumeCanvas: $('#volume-chart'),
+    rsiCanvas: $('#rsi-chart'),
+    macdCanvas: $('#macd-chart'),
+    gainers: $('#gainers-list'),
+    losers: $('#losers-list'),
+    portfolioBody: $('#portfolio-body'),
+    sentimentBody: $('#sentiment-body'),
+    sentimentSymbol: $('#sentiment-symbol'),
+    tfButtons: Array.prototype.slice.call(document.querySelectorAll('.tf-btn')),
+    indChips: Array.prototype.slice.call(document.querySelectorAll('.ind-chip'))
+  };
+
+  if (!window.Chart) {
+    showToast('Chart library failed to load — check the CDN', true);
+    return;
+  }
+  setupChartDefaults();
+
+  bindChartsEvents();
+  loadMovers();
+  loadPortfolio();
+  loadSymbols().then(function () {
+    loadChart();
+    loadSentiment();
+  }).catch(function () {
+    loadChart();
+    loadSentiment();
+  });
+}
+
 /* ---------- Symbols ---------- */
 function loadSymbols() {
   return fetchJson(API.symbols).then(function (data) {
@@ -371,9 +832,8 @@ function loadSymbols() {
     var html = '';
     html += buildGroup('Equities', eq);
     html += buildGroup('Indices', idx);
-    el.symbolSelect.innerHTML = html || '<option value="">No symbols</option>';
+    chartEl.symbolSelect.innerHTML = html || '<option value="">No symbols</option>';
 
-    // Default to TCS (an EQ); fall back to first equity if absent.
     var hasDefault = eq.some(function (s) { return s.symbol === DEFAULT_SYMBOL; });
     if (hasDefault) {
       currentSymbol = DEFAULT_SYMBOL;
@@ -382,9 +842,9 @@ function loadSymbols() {
     } else if (idx.length) {
       currentSymbol = idx[0].symbol;
     }
-    el.symbolSelect.value = currentSymbol;
+    chartEl.symbolSelect.value = currentSymbol;
   }).catch(function (err) {
-    el.symbolSelect.innerHTML = '<option value="' + esc(currentSymbol) + '">' + esc(currentSymbol) + '</option>';
+    chartEl.symbolSelect.innerHTML = '<option value="' + esc(currentSymbol) + '">' + esc(currentSymbol) + '</option>';
     showToast('Failed to load symbols: ' + err.message, true);
   });
 }
@@ -399,32 +859,13 @@ function buildGroup(label, list) {
 }
 
 /* ---------- Chart data loading ---------- */
-// Fetch one series feed for the active symbol/timeframe/range. MAX expands
-// past the backend's 5000-row cap: when the first call returns a full batch,
-// fetch the older tail via from=<earliest ts day> and merge (deduped by ts).
+// Default lookback windows per timeframe (no user date-range controls):
+// 1d → 6M, 15m → 3M, 5m → 1M via the backend `days` param.
 function fetchSeries(path, sym, tf) {
-  var base = path + '?symbol=' + encodeURIComponent(sym) +
-             '&timeframe=' + encodeURIComponent(tf);
-  var q = rangeParams();
-  var url = base + (q ? '&' + q : '');
-  return fetchJson(url).then(function (data) {
-    if (activePreset !== 'MAX') { return data; }
-    var candles = Array.isArray(data.candles) ? data.candles : [];
-    if (!candles.length || candles.length < MAX_FETCH_LIMIT) { return data; }
-    var earliest = candles[0].ts;
-    var fromDate = (typeof earliest === 'string' && earliest.length >= 10)
-      ? earliest.slice(0, 10) : null;
-    if (!fromDate) { return data; }
-    return fetchJson(base + '&from=' + encodeURIComponent(fromDate)).then(function (older) {
-      var olderCandles = Array.isArray(older.candles) ? older.candles : [];
-      var seen = {}, merged = [];
-      olderCandles.concat(candles).forEach(function (c) {
-        var k = c.ts;
-        if (!seen[k]) { seen[k] = 1; merged.push(c); }
-      });
-      return { symbol: data.symbol, timeframe: data.timeframe, candles: merged };
-    });
-  });
+  var url = path + '?symbol=' + encodeURIComponent(sym) +
+            '&timeframe=' + encodeURIComponent(tf) +
+            '&days=' + (DAYS_BY_TF[tf] || 180);
+  return fetchJson(url);
 }
 
 function loadChart() {
@@ -433,8 +874,6 @@ function loadChart() {
 
   showToast('Loading ' + sym + ' ' + TF_LABEL[tf] + '…');
 
-  // Prefer the indicators feed (it carries OHLCV + indicator columns); fall
-  // back to plain candles when it is unavailable (older backend).
   fetchSeries(API.indicators, sym, tf).then(function (data) {
     if (seq !== loadSeq) { return; }
     renderAll(data, true);
@@ -447,8 +886,8 @@ function loadChart() {
       if (seq !== loadSeq) { return; }
       destroyAllCharts();
       setChipsEnabled(false);
-      el.chartTitle.textContent = sym + ' · ' + TF_LABEL[tf] + ' · unavailable';
-      el.chartRange.textContent = '';
+      chartEl.chartTitle.textContent = sym + ' · ' + TF_LABEL[tf] + ' · unavailable';
+      chartEl.chartRange.textContent = '';
       showToast('Failed to load chart data: ' + err.message, true);
     });
   });
@@ -459,8 +898,8 @@ function renderAll(data, withIndicators) {
   if (!candles.length) {
     destroyAllCharts();
     setChipsEnabled(false);
-    el.chartTitle.textContent = currentSymbol + ' · ' + TF_LABEL[currentTimeframe] + ' · no data';
-    el.chartRange.textContent = '';
+    chartEl.chartTitle.textContent = currentSymbol + ' · ' + TF_LABEL[currentTimeframe] + ' · no data';
+    chartEl.chartRange.textContent = '';
     showToast('No candle data for ' + currentSymbol + ' ' + TF_LABEL[currentTimeframe], true);
     return;
   }
@@ -520,9 +959,6 @@ function downsample(items, maxPoints) {
 }
 
 /* ---------- Series builders ---------- */
-// Per-candle x-axis labels for the category scale: 1d → '06 Aug', intraday →
-// 'HH:mm' (the ticks callback surfaces the date at day boundaries; tooltips
-// always show the full date via fmtTs, never these short labels).
 function buildLabels() {
   return currentItems.map(function (it) {
     var dt = toDateTime(it.x);
@@ -534,10 +970,6 @@ function buildLabels() {
   });
 }
 
-// Tooltip title for every chart: on a category scale the data index is the
-// position — resolve the candle's epoch-ms from the parallel currentItems
-// array to always show the full date+time. Uses dataIndex (never undefined),
-// not parsed.x, because parsing:false leaves parsed shape dataset-dependent.
 function tooltipTitle(items) {
   var idx = items && items.length ? items[0].dataIndex : -1;
   return (idx >= 0 && idx < currentItems.length) ? fmtTs(currentItems[idx].x) : '';
@@ -577,13 +1009,8 @@ function candleDataset() {
     data: currentItems.map(function (it, i) {
       return { x: i, o: it.o, h: it.h, l: it.l, c: it.c };
     }),
-    // NOTE: parsing must stay ENABLED for candlesticks — chartjs-chart-financial's
-    // tooltip getLabelAndValue/getParsed path crashes on parsing:false.
     color: { up: UP, down: DOWN, unchanged: FLAT },
     borderColor: { up: UP, down: DOWN, unchanged: FLAT },
-    // Explicit hover variants: the plugin's hover style resolution calls
-    // .toString() on the value — missing hover colors crash the hover/tooltip
-    // event pipeline (chart._active fills but tooltip never renders).
     hoverBackgroundColor: { up: 'rgba(63,185,80,0.40)', down: 'rgba(248,81,73,0.40)', unchanged: FLAT },
     hoverBorderColor: { up: UP, down: DOWN, unchanged: FLAT },
     order: 1
@@ -649,11 +1076,6 @@ function destroyAllCharts() {
   lastHoverIndex = -1;
 }
 
-// Category (index-based) x scale shared by every chart. Position is the data
-// ARRAY INDEX, so candles are ALWAYS evenly spaced — weekend/overnight gaps are
-// structurally impossible. All charts share the same per-candle labels array;
-// dataset x values are array indexes. hideTicks for the middle sub-panels
-// (TradingView single-axis look: main + bottom panel show the x labels).
 function xScaleOpts(labels, hideTicks) {
   var opts = {
     type: 'category',
@@ -672,16 +1094,12 @@ function xScaleOpts(labels, hideTicks) {
       font: { size: 9 }
     };
     if (currentTimeframe !== '1d') {
-      // Intraday labels are 'HH:mm' and repeat across days — surface the date
-      // on the first tick of each day (tick.value is the data index).
       opts.ticks.callback = intradayTickLabel;
     }
   }
   return opts;
 }
 
-// Ticks callback for intraday timeframes: show the full date when this tick's
-// day differs from the previous DATA point, else the plain 'HH:mm'.
 function intradayTickLabel(value, i, ticks) {
   var idx = Number(value);
   if (!isFinite(idx) || idx < 0 || idx >= currentItems.length) { return String(value); }
@@ -699,7 +1117,7 @@ function intradayTickLabel(value, i, ticks) {
 function renderMainChart() {
   if (chart) { chart.destroy(); chart = null; }
 
-  chart = new Chart(el.chartCanvas, {
+  chart = new Chart(chartEl.chartCanvas, {
     type: 'candlestick',
     data: { labels: currentLabels, datasets: buildMainDatasets() },
     options: {
@@ -707,9 +1125,6 @@ function renderMainChart() {
       maintainAspectRatio: false,
       animation: { duration: 250 },
       interaction: { mode: 'index', intersect: false },
-      // chartjs-chart-financial 0.2.1 overrides hover.mode to 'label' — a
-      // Chart.js v3 mode that does NOT exist in v4.4's Interaction.modes, so
-      // chart._active stays empty and onHover/active never fire. Force index.
       hover: { mode: 'index', intersect: false },
       onHover: function (evt, active) { syncHover(active); },
       plugins: {
@@ -754,7 +1169,7 @@ function renderVolumePanel() {
     return it.c >= it.o ? 'rgba(63,185,80,0.45)' : 'rgba(248,81,73,0.45)';
   });
 
-  volumeChart = new Chart(el.volumeCanvas, {
+  volumeChart = new Chart(chartEl.volumeCanvas, {
     type: 'bar',
     data: {
       labels: currentLabels,
@@ -816,7 +1231,7 @@ function guideDataset(label, y, color) {
 function renderRsiPanel() {
   if (rsiChart) { rsiChart.destroy(); rsiChart = null; }
 
-  rsiChart = new Chart(el.rsiCanvas, {
+  rsiChart = new Chart(chartEl.rsiCanvas, {
     type: 'line',
     data: {
       labels: currentLabels,
@@ -880,7 +1295,7 @@ function renderMacdPanel() {
     return v >= 0 ? 'rgba(63,185,80,0.5)' : 'rgba(248,81,73,0.5)';
   });
 
-  macdChart = new Chart(el.macdCanvas, {
+  macdChart = new Chart(chartEl.macdCanvas, {
     type: 'bar',
     data: {
       labels: currentLabels,
@@ -933,8 +1348,6 @@ function renderMacdPanel() {
       animation: { duration: 200 },
       interaction: { mode: 'index', intersect: false },
       plugins: {
-        // Legend hidden so every sub-panel is a pixel-identical column
-        // (same fixed canvas height); dataset names still show in tooltips.
         legend: { display: false },
         tooltip: Object.assign({}, TOOLTIP_STYLE, {
           callbacks: {
@@ -959,7 +1372,7 @@ function renderMacdPanel() {
   });
 }
 
-/* ---------- Cross-chart hover sync (index-aligned category axes) ---------- */
+/* ---------- Cross-chart hover sync ---------- */
 function syncHover(active) {
   var i = -1;
   if (active && active.length) { i = active[0].index; }
@@ -976,8 +1389,6 @@ function syncHover(active) {
         var el = ch.getDatasetMeta(0) && ch.getDatasetMeta(0).data[i];
         var pos = (el && typeof el.getCenterPoint === 'function') ? el.getCenterPoint() : {};
         ch.setActiveElements([{ datasetIndex: 0, index: i }]);
-        // The financial plugin's hover override breaks the tooltip's own event
-        // path (tooltip._active never fills) — force it from the synced index.
         if (ch.tooltip) { ch.tooltip.setActiveElements([{ datasetIndex: 0, index: i }], pos); }
       }
       ch.update('none');
@@ -987,30 +1398,36 @@ function syncHover(active) {
 
 /* ---------- Chart meta ---------- */
 function updateChartMeta() {
-  el.chartTitle.textContent = currentSymbol + ' · ' + TF_LABEL[currentTimeframe];
+  chartEl.chartTitle.textContent = currentSymbol + ' · ' + TF_LABEL[currentTimeframe];
   if (!currentItems.length) {
-    el.chartRange.textContent = '';
+    chartEl.chartRange.textContent = '';
     return;
   }
   var first = currentItems[0].x;
   var last = currentItems[currentItems.length - 1].x;
-  var from = currentRange.from || first;
-  var to = currentRange.to || last;
-  el.chartRange.textContent = fmtRange(from, to) + ' · ' + currentItems.length + ' bars';
+  chartEl.chartRange.textContent = fmtRange(first, last) + ' · ' + currentItems.length + ' bars';
 }
 
 function setChipsEnabled(enabled) {
-  el.indChips.forEach(function (btn) {
+  chartEl.indChips.forEach(function (btn) {
     btn.disabled = !enabled;
     btn.classList.toggle('disabled', !enabled);
+  });
+}
+
+function resizeAllCharts() {
+  [chart, volumeChart, rsiChart, macdChart, equityChart].forEach(function (ch) {
+    if (ch && typeof ch.resize === 'function') {
+      try { ch.resize(); } catch (e) { /* ignore */ }
+    }
   });
 }
 
 /* ---------- Movers ---------- */
 function loadMovers() {
   fetchJson(API.movers + '?n=10').then(function (data) {
-    renderMovers(el.gainers, data.gainers, true);
-    renderMovers(el.losers, data.losers, false);
+    renderMovers(chartEl.gainers, data.gainers, true);
+    renderMovers(chartEl.losers, data.losers, false);
   }).catch(function (err) {
     showToast('Failed to load movers: ' + err.message, true);
   });
@@ -1033,7 +1450,7 @@ function renderMovers(ul, rows, isGainers) {
   });
 }
 
-/* ---------- Portfolio ---------- */
+/* ---------- Sidebar portfolio summary ---------- */
 function loadPortfolio() {
   fetchJson(API.portfolio).then(function (d) {
     renderPortfolio(d);
@@ -1043,7 +1460,7 @@ function loadPortfolio() {
 }
 
 function renderPortfolio(d) {
-  var body = el.portfolioBody;
+  var body = chartEl.portfolioBody;
   body.textContent = '';
 
   var summary = (d && d.summary) ? d.summary : null;
@@ -1053,8 +1470,8 @@ function renderPortfolio(d) {
   if (!summary || (!positions.length && !(isFinite(tradeCount) && tradeCount > 0))) {
     body.appendChild(emptyState(
       '💼',
-      'Bot trading lands in Phase 5',
-      'Paper-trade stats will appear here once the trading bot goes live.'
+      'No paper trades yet',
+      'Paper-trade stats will appear here once the bot trades.'
     ));
     return;
   }
@@ -1087,7 +1504,7 @@ function pfStat(k, v, cls) {
   return d;
 }
 
-/* ---------- Sentiment ---------- */
+/* ---------- Sentiment (sidebar) ---------- */
 function loadSentiment() {
   var seq = ++sentimentSeq;
   var sym = currentSymbol;
@@ -1101,15 +1518,15 @@ function loadSentiment() {
 }
 
 function renderSentiment(d, sym) {
-  el.sentimentSymbol.textContent = sym;
-  var body = el.sentimentBody;
+  chartEl.sentimentSymbol.textContent = sym;
+  var body = chartEl.sentimentBody;
   body.textContent = '';
 
   var rows = (d && Array.isArray(d.rows)) ? d.rows : [];
   if (!rows.length) {
     body.appendChild(emptyState(
       '📰',
-      'News sentiment lands in Phase 3',
+      'News sentiment',
       'Scored headlines for ' + sym + ' will show here once the pipeline goes live.'
     ));
     return;
@@ -1147,6 +1564,110 @@ function sentiRow(r) {
   return row;
 }
 
+/* ==========================================================================
+   PAGE 4 · RAW DATA VIEWER
+   ========================================================================== */
+var rawEl = null;
+
+function initDataPage() {
+  rawEl = {
+    tableSelect: $('#raw-table-select'),
+    limitSelect: $('#raw-limit-select'),
+    meta: $('#raw-meta'),
+    wrap: $('#raw-table-wrap'),
+    refreshBtn: $('#raw-refresh')
+  };
+
+  RAW_TABLES.forEach(function (t) {
+    var opt = document.createElement('option');
+    opt.value = t;
+    opt.textContent = t;
+    rawEl.tableSelect.appendChild(opt);
+  });
+  rawEl.tableSelect.value = RAW_TABLES[0];
+
+  rawEl.tableSelect.addEventListener('change', loadRaw);
+  rawEl.limitSelect.addEventListener('change', loadRaw);
+  rawEl.refreshBtn.addEventListener('click', loadRaw);
+
+  loadRaw();
+}
+
+function loadRaw() {
+  if (!rawEl) { return; }
+  var table = rawEl.tableSelect.value;
+  var limit = rawEl.limitSelect.value;
+  var wrap = rawEl.wrap;
+
+  wrap.textContent = '';
+  var loading = mkEl('div', 'raw-loading', 'Loading ' + table + '…');
+  wrap.appendChild(loading);
+  rawEl.meta.textContent = 'table: ' + table + ' · limit: ' + limit;
+
+  fetchJson(API.raw + '?table=' + encodeURIComponent(table) + '&limit=' + encodeURIComponent(limit))
+    .then(function (d) {
+      renderRawTable(d);
+    })
+    .catch(function (err) {
+      wrap.textContent = '';
+      var e = mkEl('div', 'raw-error', 'Failed to load ' + table + ': ' + err.message);
+      wrap.appendChild(e);
+    });
+}
+
+function renderRawTable(d) {
+  var wrap = rawEl.wrap;
+  wrap.textContent = '';
+
+  var columns = (d && Array.isArray(d.columns)) ? d.columns : [];
+  var rows = (d && Array.isArray(d.rows)) ? d.rows : [];
+
+  rawEl.meta.textContent = 'table: ' + (d.table || '?') + ' · ' + rows.length + ' rows · ' + columns.length + ' columns';
+
+  if (!rows.length) {
+    wrap.appendChild(emptyState('🗃️', 'No rows', 'Table ' + (d.table || '?') + ' is empty.'));
+    return;
+  }
+  if (!columns.length) {
+    wrap.appendChild(emptyState('🗃️', 'No columns', 'The backend returned no column metadata.'));
+    return;
+  }
+
+  var tbl = mkEl('table', 'raw-table');
+  var thead = mkEl('thead');
+  var htr = mkEl('tr');
+  columns.forEach(function (c) {
+    var th = mkEl('th');
+    th.appendChild(mkEl('div', 'raw-col-name', c.column_name));
+    th.appendChild(mkEl('div', 'raw-col-type', c.data_type));
+    htr.appendChild(th);
+  });
+  thead.appendChild(htr);
+  tbl.appendChild(thead);
+
+  var tbody = mkEl('tbody');
+  rows.forEach(function (r) {
+    var tr = mkEl('tr');
+    columns.forEach(function (c) {
+      var td = mkEl('td');
+      var v = r[c.column_name];
+      if (v === null || v === undefined) {
+        td.textContent = '∅';
+        td.style.color = '#6e7681';
+      } else if (typeof v === 'object') {
+        td.textContent = JSON.stringify(v);
+      } else {
+        td.textContent = String(v);
+      }
+      td.title = td.textContent;   // full value on hover
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+  tbl.appendChild(tbody);
+  wrap.appendChild(tbl);
+}
+
 /* ---------- Empty state builder ---------- */
 function emptyState(icon, title, hint) {
   var box = mkEl('div', 'empty-state');
@@ -1156,86 +1677,57 @@ function emptyState(icon, title, hint) {
   return box;
 }
 
-/* ---------- Events ---------- */
-el.symbolSelect.addEventListener('change', function () {
-  var next = el.symbolSelect.value;
-  if (!next || next === currentSymbol) { return; }
-  currentSymbol = next;
-  loadChart();
-  loadSentiment();
-});
-
-el.tfButtons.forEach(function (btn) {
-  btn.addEventListener('click', function () {
-    var tf = btn.getAttribute('data-tf');
-    if (!tf || tf === currentTimeframe) { return; }
-    currentTimeframe = tf;
-    el.tfButtons.forEach(function (b) { b.classList.toggle('active', b === btn); });
-    // Re-apply the current preset (or the new timeframe's default when the
-    // user never picked one); keep a custom range untouched.
-    if (!presetTouched) {
-      setPreset(DEFAULT_PRESET_BY_TF[tf] || '6M');
-    } else if (activePreset) {
-      setPreset(activePreset);
-    }
+/* ==========================================================================
+   EVENTS / INIT
+   ========================================================================== */
+// Charts page events (bound once at lazy init)
+function bindChartsEvents() {
+  chartEl.symbolSelect.addEventListener('change', function () {
+    var next = chartEl.symbolSelect.value;
+    if (!next || next === currentSymbol) { return; }
+    currentSymbol = next;
     loadChart();
+    loadSentiment();
   });
-});
 
-el.presetBtns.forEach(function (btn) {
-  btn.addEventListener('click', function () {
-    var key = btn.getAttribute('data-preset');
-    if (key) { applyPreset(key); }
+  chartEl.tfButtons.forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var tf = btn.getAttribute('data-tf');
+      if (!tf || tf === currentTimeframe) { return; }
+      currentTimeframe = tf;
+      chartEl.tfButtons.forEach(function (b) { b.classList.toggle('active', b === btn); });
+      loadChart();
+    });
   });
-});
 
-el.applyRangeBtn.addEventListener('click', applyCustomRange);
-
-[el.fromDate, el.toDate].forEach(function (inp) {
-  inp.addEventListener('keydown', function (e) {
-    if (e.key === 'Enter') { applyCustomRange(); }
+  chartEl.indChips.forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var key = btn.getAttribute('data-ind');
+      if (!key || !hasIndicators || !indicatorsState.hasOwnProperty(key)) { return; }
+      indicatorsState[key] = !indicatorsState[key];
+      btn.classList.toggle('active', indicatorsState[key]);
+      applyOverlays();
+    });
   });
-});
+}
 
-el.indChips.forEach(function (btn) {
-  btn.addEventListener('click', function () {
-    var key = btn.getAttribute('data-ind');
-    if (!key || !hasIndicators || !indicatorsState.hasOwnProperty(key)) { return; }
-    indicatorsState[key] = !indicatorsState[key];
-    btn.classList.toggle('active', indicatorsState[key]);
-    applyOverlays();
-  });
-});
-
-/* ---------- Init ---------- */
-function init() {
-  if (!window.Chart) {
-    showToast('Chart library failed to load — check the CDN', true);
-    return;
-  }
+function boot() {
   setupChartDefaults();
 
-  // Initial range: the timeframe's default preset (1d → 6M, 15m → 3M, 5m → 1M).
-  setPreset(DEFAULT_PRESET_BY_TF[DEFAULT_TIMEFRAME] || '6M');
+  // Default route: #/portfolio (also when no hash at all).
+  if (!location.hash) {
+    try { history.replaceState(null, '', '#/portfolio'); } catch (e) { location.hash = '#/portfolio'; }
+  }
+  window.addEventListener('hashchange', route);
+  route();
 
   loadHealth();
-  loadMovers();
-  loadPortfolio();
 
-  loadSymbols().then(function () {
-    loadChart();
-    loadSentiment();
-  }).catch(function () {
-    // symbols failed; still try the chart for the default symbol
-    loadChart();
-    loadSentiment();
-  });
-
-  // Silent auto-refresh: movers + status chip every 60s (never the chart).
+  // Silent auto-refresh: status chip every 60s; portfolio panel refresh while visible.
   setInterval(function () {
     loadHealth();
-    loadMovers();
+    if (currentRoute() === 'portfolio') { refreshPortfolio(); }
   }, REFRESH_MS);
 }
 
-init();
+boot();
