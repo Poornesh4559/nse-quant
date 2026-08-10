@@ -840,8 +840,21 @@ function loadSymbols() {
     var eq = symbols.filter(function (s) { return s.instrument_type !== 'INDEX'; });
     var idx = symbols.filter(function (s) { return s.instrument_type === 'INDEX'; });
 
+    // group equities by SECTOR (option text: SYMBOL — name [SECTOR])
+    var bySector = {};
+    eq.forEach(function (s) {
+      var sec = s.sector || 'OTHER';
+      (bySector[sec] = bySector[sec] || []).push(s);
+    });
     var html = '';
-    html += buildGroup('Equities', eq);
+    Object.keys(bySector).sort().forEach(function (sec) {
+      var list = bySector[sec].sort(function (a, b) { return a.symbol < b.symbol ? -1 : 1; });
+      html += '<optgroup label="' + esc(sec) + ' (' + list.length + ')">' +
+        list.map(function (s) {
+          return '<option value="' + esc(s.symbol) + '">' + esc(s.symbol) +
+            (s.name ? ' — ' + esc(s.name) : '') + ' [' + esc(sec) + ']</option>';
+        }).join('') + '</optgroup>';
+    });
     html += buildGroup('Indices', idx);
     chartEl.symbolSelect.innerHTML = html || '<option value="">No symbols</option>';
 

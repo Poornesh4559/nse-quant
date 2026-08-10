@@ -278,10 +278,10 @@ def health() -> dict[str, Any]:
 
 @app.get("/api/symbols")
 def list_symbols() -> dict[str, list[dict[str, Any]]]:
-    """Reference list of all instruments in the `symbols` table."""
+    """Reference list of all instruments in the `symbols` table (incl. sector)."""
     with _get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT symbol, name, instrument_type FROM symbols ORDER BY symbol")
+            cur.execute("SELECT symbol, name, sector, instrument_type FROM symbols ORDER BY symbol")
             rows = [dict(r) for r in cur.fetchall()]
     return {"symbols": rows}
 

@@ -52,9 +52,21 @@ def technical_snapshot(symbol: str) -> dict:
     return out
 
 
+def _sector(symbol: str) -> str | None:
+    """Sector of a symbol from the symbols table (None if unknown)."""
+    from bot.paper import db
+    try:
+        with db() as conn, conn.cursor() as cur:
+            cur.execute("SELECT sector FROM symbols WHERE symbol=%s", (symbol,))
+            row = cur.fetchone()
+        return row[0] if row and row[0] else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def build_context(symbol: str, action: str, price: float, qty: int,
                   pick: dict | None, regime: dict) -> dict:
-    """Full decision context: ranking inputs + regime + technicals."""
+    """Full decision context: ranking inputs + regime + technicals + sector."""
     tech = technical_snapshot(symbol)
     sent_7d = None
     if pick:
@@ -68,8 +80,10 @@ def build_context(symbol: str, action: str, price: float, qty: int,
     else:
         ctx = {"symbol": symbol, "action": action, "price": round(price, 2), "qty": qty}
     ctx.update({
+        "sector": _sector(symbol),
         "market_sentiment": regime.get("market"),
         "global_cues": regime.get("cues"),
+        "asia_avg_chg_pct": regime.get("asia"),
         "regime_score": round(regime.get("score", 0.0), 4),
         "regime_risk_on": regime.get("risk_on"),
         **tech,

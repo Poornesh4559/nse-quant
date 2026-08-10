@@ -36,7 +36,8 @@ STOP_LOSS = 0.05            # -5% close -> exit next open (hard floor, always)
 GUARDRAIL = -0.1            # sent_3d <= this blocks entry
 BUFFER = 2                  # hold until composite rank > top_n + buffer
 REGIME_W_MARKET = 0.6       # market_sentiment weight in the regime score
-REGIME_W_CUES = 0.4         # global_cues weight
+REGIME_W_CUES = 0.25        # global-cues news weight
+REGIME_W_ASIA = 0.15        # Asian-market early-cues weight (open before India)
 REGIME_OFF = -0.1           # regime score <= this -> risk-off (cash)
 STRATEGY = "paper-v1"
 
@@ -70,16 +71,30 @@ def load_picks() -> dict:
 
 
 def market_regime() -> dict:
-    """Regime score = 0.6*market_sentiment + 0.4*global_cues (latest rows)."""
+    """Regime score = 0.6*market_sentiment + 0.25*cues news + 0.15*asia cues.
+
+    Asia component: average % move of Nikkei/HSI/Shanghai/STI (they open
+    BEFORE India), clipped to ±2% and scaled to [-1, 1] (/2).
+    """
     with db() as conn, conn.cursor() as cur:
         cur.execute("SELECT avg_compound FROM market_sentiment ORDER BY date DESC LIMIT 1")
         ms = cur.fetchone()
-        cur.execute("SELECT avg_compound FROM global_cues ORDER BY date DESC LIMIT 1")
-        gc = cur.fetchone()
+        cur.execute("SELECT avg_compound, themes FROM global_cues ORDER BY date DESC LIMIT 1")
+        gc_row = cur.fetchone()
     ms = ms[0] if ms else 0.0
-    gc = gc[0] if gc else 0.0
-    score = REGIME_W_MARKET * (ms or 0.0) + REGIME_W_CUES * (gc or 0.0)
-    return {"score": score, "market": ms, "cues": gc,
+    gc = gc_row[0] if gc_row else 0.0
+    asia_avg = 0.0
+    if gc_row and gc_row[1]:
+        import json as _json
+        try:
+            themes = _json.loads(gc_row[1]) if isinstance(gc_row[1], str) else gc_row[1]
+            a = (themes or {}).get("asia", {})
+            asia_avg = float(a.get("avg_chg_pct", 0.0) or 0.0)
+        except Exception:  # noqa: BLE001
+            asia_avg = 0.0
+    asia_score = max(-1.0, min(1.0, asia_avg / 2.0))  # ±2% -> ±1
+    score = REGIME_W_MARKET * (ms or 0.0) + REGIME_W_CUES * (gc or 0.0) + REGIME_W_ASIA * asia_score
+    return {"score": score, "market": ms, "cues": gc, "asia": round(asia_avg, 2),
             "risk_on": score > REGIME_OFF}
 
 

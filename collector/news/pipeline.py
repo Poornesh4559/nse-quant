@@ -258,6 +258,15 @@ def cmd_cues(mapper, scorer, store_mod, sources_mod, config_mod) -> int:
             rows.append(row)
     stored = _safe_store(store_mod, rows)
 
+    # Asian-market early cues (open before India): actual index % moves
+    asia: dict[str, dict] = {}
+    try:
+        from collector.sectors import fetch_asia
+        asia = fetch_asia()
+    except Exception:  # noqa: BLE001
+        logger.exception("asia fetch failed")
+    asia_avg = (sum(m["chg_pct"] for m in asia.values()) / len(asia)) if asia else None
+
     theme_buckets: dict[str, dict] = {}
     for r in rows:
         theme = r.get("theme") or "other"
@@ -275,9 +284,14 @@ def cmd_cues(mapper, scorer, store_mod, sources_mod, config_mod) -> int:
     direction = "BULLISH" if avg >= 0.1 else ("BEARISH" if avg <= -0.1 else "NEUTRAL")
 
     import json as _json
-    themes_json = _json.dumps(
-        {k: {"avg": round(v["sum"] / v["n"], 4), "n": v["n"]} for k, v in theme_buckets.items()}
-    )
+    themes_obj = {k: {"avg": round(v["sum"] / v["n"], 4), "n": v["n"]} for k, v in theme_buckets.items()}
+    if asia:
+        themes_obj["asia"] = {
+            "avg_chg_pct": round(asia_avg, 3),  # type: ignore[arg-type]
+            "indices": {m["name"]: {"chg_pct": m["chg_pct"], "last": m["last"], "market": m["market"]}
+                        for m in asia.values()},
+        }
+    themes_json = _json.dumps(themes_obj)
     today = datetime.now(timezone.utc).date()
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
@@ -298,6 +312,12 @@ def cmd_cues(mapper, scorer, store_mod, sources_mod, config_mod) -> int:
     for theme, b in theme_buckets.items():
         t_avg = b["sum"] / b["n"]
         print(f"  {theme:10s}: {t_avg:+.3f}  ({b['n']} articles)")
+    if asia:
+        print("  asia      : Asian markets opened BEFORE India:")
+        for m in asia.values():
+            arrow = "🟢" if m["chg_pct"] >= 0 else "🔴"
+            print(f"    {arrow} {m['name']:<16} {m['chg_pct']:+.2f}%")
+        print(f"    ASIA AVG {asia_avg:+.2f}%  ->  {'risk-on tilt' if (asia_avg or 0) >= 0 else 'risk-off tilt'}")
     print("=============================\n")
     return stored
 
