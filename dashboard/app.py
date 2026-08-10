@@ -12,6 +12,7 @@ repo-root ``.env`` (see collector/config.py for the same convention).
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -63,9 +64,11 @@ def _get_conn() -> Iterator[psycopg2.extensions.connection]:
         conn.close()
 
 
-def _iso(dt: datetime) -> str:
-    """Serialize a tz-aware datetime as ISO8601 in Asia/Kolkata."""
-    return dt.astimezone(IST).isoformat()
+def _iso(dt) -> str:
+    """Serialize a tz-aware datetime (or plain date) as ISO in Asia/Kolkata."""
+    if isinstance(dt, datetime):
+        return dt.astimezone(IST).isoformat()
+    return dt.isoformat()  # datetime.date / date
 
 
 def _is_market_open(now: datetime | None = None) -> bool:
@@ -396,6 +399,141 @@ def portfolio() -> dict[str, Any]:
         "trade_count": trade_count,
     }
     return {"summary": summary, "positions": positions}
+
+
+@app.get("/api/recent-trades")
+def recent_trades(
+    limit: int = Query(10, ge=1, le=50, description="Newest N trades with full decision context"),
+) -> dict[str, Any]:
+    """Last N trades joined with their full decision log (composite, ML prob,
+    sentiment, regime, technicals, LLM rating/reason) — the complete trace."""
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT t.id AS trade_id, t.symbol, t.side, t.qty, t.price,
+                          t.ts, t.fees, t.pnl, t.pnl_pct, t.exit_reason, t.position_id,
+                          d.composite_score, d.mom_rank, d.ml_p_up, d.sent_3d,
+                          d.market_sentiment, d.global_cues, d.regime_score, d.regime_risk_on,
+                          d.rsi14, d.macd, d.bb_pos, d.atr14, d.ret_1, d.ret_5, d.ret_21,
+                          d.llm_rating, d.llm_reason, d.llm_model
+                   FROM trades t
+                   LEFT JOIN trade_decisions d ON d.trade_id = t.id
+                   ORDER BY t.ts DESC LIMIT %s""",
+                (limit,),
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+    for t in rows:
+        t["ts"] = _iso(t["ts"])
+        t["qty"] = int(t["qty"])
+    return {"trades": rows}
+
+
+@app.get("/api/market")
+def market_panel() -> dict[str, Any]:
+    """Landing-panel data: latest market sentiment call, global cues (with
+    per-theme breakdown) and the latest equity snapshot vs benchmark."""
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT date, avg_compound, n_articles, n_positive, n_negative, direction "
+                "FROM market_sentiment ORDER BY date DESC LIMIT 1"
+            )
+            row = cur.fetchone()
+            ms = dict(row) if row else None
+            cur.execute(
+                "SELECT date, avg_compound, n_articles, n_positive, n_negative, direction, themes "
+                "FROM global_cues ORDER BY date DESC LIMIT 1"
+            )
+            row = cur.fetchone()
+            gc = dict(row) if row else None
+            if gc:
+                gc["themes"] = json.loads(gc["themes"]) if isinstance(gc["themes"], str) else gc["themes"]
+            cur.execute(
+                "SELECT date, equity, cash, benchmark, strategy FROM equity_curve "
+                "ORDER BY date DESC LIMIT 1"
+            )
+            row = cur.fetchone()
+            eq = dict(row) if row else None
+    return {"market_sentiment": ms, "global_cues": gc, "equity": eq}
+
+
+@app.get("/api/equity")
+def equity_series(
+    limit: int = Query(200, ge=2, le=1000, description="Equity curve rows (oldest first)"),
+) -> dict[str, Any]:
+    """Daily paper equity vs benchmark (NIFTY 50 buy-hold), oldest first."""
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT date, equity, cash, benchmark, strategy FROM equity_curve "
+                "ORDER BY date DESC LIMIT %s",
+                (limit,),
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+    rows.reverse()
+    for r in rows:
+        r["date"] = _iso(r["date"])
+    return {"points": rows}
+
+
+@app.get("/api/decisions")
+def decisions(
+    limit: int = Query(20, ge=1, le=200, description="Newest N decision-log rows"),
+) -> dict[str, Any]:
+    """Raw trade_decisions rows (the training log), newest first."""
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM trade_decisions ORDER BY decision_ts DESC LIMIT %s", (limit,)
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+    for r in rows:
+        r["decision_ts"] = _iso(r["decision_ts"])
+    return {"decisions": rows}
+
+
+RAW_TABLES = {
+    "trades": "trades",
+    "trade_decisions": "trade_decisions",
+    "news_sentiment": "news_sentiment",
+    "market_sentiment": "market_sentiment",
+    "global_cues": "global_cues",
+    "equity_curve": "equity_curve",
+    "symbols": "symbols",
+    "candles_1d": "candles",
+}
+
+
+@app.get("/api/raw")
+def raw_table(
+    table: str = Query(..., description="Whitelisted table key: " + ", ".join(RAW_TABLES)),
+    limit: int = Query(50, ge=1, le=500, description="Max rows"),
+) -> dict[str, Any]:
+    """Raw table viewer over a whitelist. candles_1d maps to candles filtered
+    to timeframe='1d' (and capped at 500 rows). Never exposes anything else."""
+    real = RAW_TABLES.get(table)
+    if not real:
+        raise HTTPException(status_code=404, detail=f"unknown table key '{table}'")
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            if real == "candles":
+                cur.execute(
+                    "SELECT * FROM candles WHERE timeframe='1d' ORDER BY ts DESC LIMIT %s", (limit,)
+                )
+            else:
+                cur.execute(f"SELECT * FROM {real} ORDER BY 1 DESC LIMIT %s", (limit,))
+            rows = [dict(r) for r in cur.fetchall()]
+            cur.execute(
+                """SELECT column_name, data_type FROM information_schema.columns
+                   WHERE table_name = %s ORDER BY ordinal_position""",
+                (real,),
+            )
+            cols = [dict(r) for r in cur.fetchall()]
+    for r in rows:
+        for k, v in r.items():
+            if hasattr(v, "isoformat"):
+                r[k] = _iso(v)
+    return {"table": real, "columns": cols, "rows": rows}
 
 
 @app.get("/api/sentiment")
