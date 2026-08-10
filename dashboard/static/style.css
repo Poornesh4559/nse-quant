@@ -349,6 +349,26 @@ main { display: block; }
   opacity: 0.85;
 }
 
+/* Chart pan controls (fixed window + horizontal pan) */
+.pan-group {
+  display: flex;
+  gap: 6px;
+  margin-left: 10px;
+  align-items: center;
+}
+.pan-btn {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  min-height: 26px;
+}
+.pan-btn:hover { color: var(--fg); border-color: var(--accent); }
+.pan-btn:active { transform: translateY(1px); }
+
 /* Chart body: main candles + stacked sub-panels */
 .chart-body {
   padding: 12px 16px 16px;

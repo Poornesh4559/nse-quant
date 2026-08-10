@@ -59,7 +59,10 @@ var API = {
 var DEFAULT_SYMBOL = 'TCS';
 var DEFAULT_TIMEFRAME = '1d';
 var REFRESH_MS = 60 * 1000;      // silent auto-refresh of side panels + status chip
-var MAX_POINTS = 2500;           // downsample above this (bucketing)
+var MAX_POINTS = 1_000_000;    // effectively disabled — full series kept for panning
+var WIN_LEN = 150;             // FIXED candle count in the visible window
+var winStart = 0;              // index into allItems (pan position)
+var allItems = [];             // full series (unwindowed) for horizontal panning
 
 // Default lookback windows per timeframe (no user date-range controls).
 var DAYS_BY_TF = { '1d': 180, '15m': 90, '5m': 30 };   // 6M / 3M / 1M
@@ -801,8 +804,16 @@ function initCharts() {
     sentimentBody: $('#sentiment-body'),
     sentimentSymbol: $('#sentiment-symbol'),
     tfButtons: Array.prototype.slice.call(document.querySelectorAll('.tf-btn')),
-    indChips: Array.prototype.slice.call(document.querySelectorAll('.ind-chip'))
+    indChips: Array.prototype.slice.call(document.querySelectorAll('.ind-chip')),
+    panPrev: $('#pan-prev'),
+    panNext: $('#pan-next'),
+    panLatest: $('#pan-latest')
   };
+
+  if (chartEl.panPrev) { chartEl.panPrev.addEventListener('click', function () { panBy(-Math.floor(WIN_LEN / 3)); }); }
+  if (chartEl.panNext) { chartEl.panNext.addEventListener('click', function () { panBy(Math.floor(WIN_LEN / 3)); }); }
+  if (chartEl.panLatest) { chartEl.panLatest.addEventListener('click', panToLatest); }
+  bindPanGestures();
 
   if (!window.Chart) {
     showToast('Chart library failed to load — check the CDN', true);
@@ -904,7 +915,7 @@ function renderAll(data, withIndicators) {
     return;
   }
 
-  currentItems = candles.map(function (c) {
+  allItems = candles.map(function (c) {
     var it = {
       x: toMs(c.ts),
       o: Number(c.open), h: Number(c.high),
@@ -916,16 +927,63 @@ function renderAll(data, withIndicators) {
     });
     return it;
   });
-  currentItems = downsample(currentItems, MAX_POINTS);
-  currentLabels = buildLabels();
-  hasIndicators = withIndicators;
-  setChipsEnabled(hasIndicators);
+  winStart = Math.max(0, allItems.length - WIN_LEN);  // default: latest window
+  applyWindow();
+}
 
+/* ---------- Fixed candle window + horizontal pan ---------- */
+function applyWindow() {
+  if (allItems.length > WIN_LEN) {
+    currentItems = allItems.slice(winStart, winStart + WIN_LEN);
+  } else {
+    winStart = 0;
+    currentItems = allItems.slice();
+  }
+  currentLabels = buildLabels();
   renderMainChart();
   renderVolumePanel();
   renderRsiPanel();
   renderMacdPanel();
   updateChartMeta();
+}
+
+function panBy(delta) {
+  if (!allItems.length) { return; }
+  var maxStart = Math.max(0, allItems.length - WIN_LEN);
+  winStart = Math.min(maxStart, Math.max(0, winStart + delta));
+  applyWindow();
+}
+
+function panToLatest() {
+  winStart = Math.max(0, allItems.length - WIN_LEN);
+  applyWindow();
+}
+
+/* Wheel + drag-to-pan on the main chart canvas (horizontal panning). */
+function bindPanGestures() {
+  if (!chartEl || !chartEl.chartCanvas) { return; }
+  var canvas = chartEl.chartCanvas;
+  canvas.addEventListener('wheel', function (e) {
+    if (!allItems.length) { return; }
+    e.preventDefault();
+    panBy(e.deltaY > 0 ? Math.floor(WIN_LEN / 5) : -Math.floor(WIN_LEN / 5));
+  }, { passive: false });
+  var downX = null;
+  var dragging = false;
+  canvas.addEventListener('pointerdown', function (e) {
+    downX = e.clientX;
+    dragging = false;
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (downX === null) { return; }
+    var dx = e.clientX - downX;
+    if (!dragging && Math.abs(dx) < 4) { return; }  // threshold: hover still works
+    dragging = true;
+    var w = canvas.clientWidth || 1;
+    panBy(-Math.round((dx / w) * WIN_LEN));
+    downX = e.clientX;
+  });
+  window.addEventListener('pointerup', function () { downX = null; });
 }
 
 /* ---------- Downsampling (bucket aggregation for big series) ---------- */
@@ -1405,7 +1463,9 @@ function updateChartMeta() {
   }
   var first = currentItems[0].x;
   var last = currentItems[currentItems.length - 1].x;
-  chartEl.chartRange.textContent = fmtRange(first, last) + ' · ' + currentItems.length + ' bars';
+  var total = allItems.length;
+  var suffix = (total > WIN_LEN) ? (' · ' + currentItems.length + '/' + total + ' bars · ◀▶ drag/wheel') : (' · ' + currentItems.length + ' bars');
+  chartEl.chartRange.textContent = fmtRange(first, last) + suffix;
 }
 
 function setChipsEnabled(enabled) {

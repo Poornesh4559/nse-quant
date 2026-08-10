@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>NSE Quant — Dashboard</title>
-  <link rel="stylesheet" href="style.css?v=20260811b">
+  <link rel="stylesheet" href="style.css?v=20260812b">
 </head>
 <body>
   <header>
@@ -87,6 +87,11 @@
           <div class="chart-title-wrap">
             <div id="chart-title" class="chart-title">—</div>
             <div id="chart-range" class="chart-range">—</div>
+          </div>
+          <div class="pan-group" role="group" aria-label="Chart pan">
+            <button type="button" id="pan-prev" class="pan-btn" title="Pan older (drag or wheel works too)">◀</button>
+            <button type="button" id="pan-next" class="pan-btn" title="Pan newer">▶</button>
+            <button type="button" id="pan-latest" class="pan-btn" title="Jump to the latest candles">Latest</button>
           </div>
         </div>
 
@@ -358,6 +363,6 @@
   <script src="https://cdn.jsdelivr.net/npm/chartjs-chart-financial@0.2.1/dist/chartjs-chart-financial.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/luxon@3.4.4/build/global/luxon.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon@1.3.1/dist/chartjs-adapter-luxon.umd.min.js"></script>
-  <script src="app.js?v=20260811b"></script>
+  <script src="app.js?v=20260812b"></script>
 </body>
 </html>

@@ -29,16 +29,22 @@ from bot.llm_gate import LLM_MIN_RATING, build_context, llm_rate, log_decision
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PICKS_PATH = REPO_ROOT / "data" / "signals" / "nextday_picks.json"
 
-CAPITAL = 30_000.0          # paper money, per user
+CAPITAL = 100_000.0         # paper money (upgraded ₹30k → ₹1L)
 TOP_N = 5                   # daily ranked top-5, equal weight
 WEIGHT = 1.0 / TOP_N
-STOP_LOSS = 0.05            # -5% close -> exit next open
+STOP_LOSS = 0.05            # -5% close -> exit next open (hard floor, always)
 GUARDRAIL = -0.1            # sent_3d <= this blocks entry
 BUFFER = 2                  # hold until composite rank > top_n + buffer
 REGIME_W_MARKET = 0.6       # market_sentiment weight in the regime score
 REGIME_W_CUES = 0.4         # global_cues weight
 REGIME_OFF = -0.1           # regime score <= this -> risk-off (cash)
 STRATEGY = "paper-v1"
+
+# --- smart-exit rules (v2) ---
+PROFIT_TAKE_PCT = 0.05      # good profit margin: >= +5% unlocks trend-break exits
+HOLD_PNL_BUFFER = 0.005     # hold when |pnl| < round-trip fees + 0.5% (no churn)
+TREND_SMA = 20              # "trend good" = close above SMA20
+SENT_HOLD = 0.0             # "sentiment good" = sent_3d > 0
 
 FEES = FeeSchedule()        # real Fyers/NSE delivery costs
 
@@ -127,6 +133,74 @@ def _last_close(symbol: str) -> float:
     return float(row[0]) if row else 0.0
 
 
+def _sma(symbol: str, period: int = TREND_SMA) -> float | None:
+    """Simple moving average of the last `period` daily closes."""
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT close FROM candles WHERE symbol=%s AND timeframe='1d' "
+                    "ORDER BY ts DESC LIMIT %s", (symbol, period))
+        rows = [r[0] for r in cur.fetchall()]
+    if len(rows) < period:
+        return None
+    return sum(rows) / len(rows)
+
+
+def _sent_3d(symbol: str) -> float:
+    """Avg sentiment compound for a symbol over the trailing 3 days."""
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT COALESCE(AVG(sentiment_compound), 0) FROM news_sentiment "
+            "WHERE symbol=%s AND published_at >= now() - interval '3 days'",
+            (symbol,),
+        )
+        return float(cur.fetchone()[0])
+
+
+def decide_exit(pos: dict, px: float, rank_pos: dict) -> tuple[str | None, str]:
+    """Smart-exit decision for one open position.
+
+    Priority: stop-loss (hard) > profit-take on trend/sentiment break >
+    rank exit (fee-aware, trend/sentiment-aware) > hold.
+
+    Returns (exit_reason_or_None, hold_reason_text). The decision is logged
+    either way so the training set sees every HOLD too.
+    """
+    entry = pos["price"]
+    qty = pos["qty"]
+    last_close = _last_close(pos["symbol"])
+    pnl_pct = (px - entry) / entry if entry else 0.0
+    rt_fees = FEES.entry_fee(qty * entry) + FEES.exit_fee(qty * px)
+    rt_pct = rt_fees / (qty * entry) if qty * entry else 1.0
+    sma = _sma(pos["symbol"])
+    trend_ok = sma is not None and last_close > sma
+    sent_ok = _sent_3d(pos["symbol"]) > SENT_HOLD
+
+    # 1) hard stop-loss — always exits, charges be damned
+    if last_close <= entry * (1 - STOP_LOSS):
+        return "stop_loss", ""
+
+    # 2) good profit margin + trend/sentiment turning -> book it
+    if pnl_pct >= PROFIT_TAKE_PCT and not (trend_ok and sent_ok):
+        return "profit_take_trend_break", ""
+
+    # 3) rank fell out of the buffer zone
+    r = rank_pos.get(pos["symbol"])
+    in_buffer = r is not None and r < TOP_N + BUFFER
+    if not in_buffer:
+        # fee-aware hold: |pnl| below round-trip charges (+buffer) and the
+        # name still has trend or sentiment support -> hold, don't feed fees
+        if abs(pnl_pct) < rt_pct + HOLD_PNL_BUFFER and (trend_ok or sent_ok):
+            return None, f"small_pnl_{pnl_pct:+.2%}_vs_fees_{rt_pct:.2%}"
+        return "signal", ""
+
+    # 4) still in buffer zone -> hold
+    reasons = []
+    if trend_ok:
+        reasons.append("trend_ok")
+    if sent_ok:
+        reasons.append("sentiment_ok")
+    return None, ("rank_in_buffer" + (f"+{'+'.join(reasons)}" if reasons else ""))
+
+
 def record_fill(side: str, symbol: str, qty: int, price: float, fees: float,
                 position_id: str, exit_reason: str | None = None,
                 pnl: float | None = None, pnl_pct: float | None = None) -> int:
@@ -178,22 +252,27 @@ def cmd_execute() -> int:
         print("[bot] risk-off: portfolio flat, cash held")
         return 0
 
-    # sells: held names beyond the buffer zone (or not in top10)
+    # sells: smart-exit engine (stop-loss > profit-take > fee-aware rank exit)
     for sym, pos in held.items():
-        r = rank_pos.get(sym)
-        if r is not None and r < TOP_N + BUFFER:
-            continue
         px = prices.get(sym, pos["price"])
+        reason, hold_text = decide_exit(pos, px, rank_pos)
+        if not reason:
+            # HOLD — still logged to the training set with why
+            ctx = build_context(sym, "HOLD", px, pos["qty"], None, regime)
+            with db() as conn:
+                log_decision(conn, ctx, (None, hold_text, "rules"), True, False)
+            print(f"[bot] HOLD {sym} ({hold_text})")
+            continue
         notional = pos["qty"] * px
         fee = FEES.exit_fee(notional)
         pnl = (px - pos["price"]) * pos["qty"] - pos["fees"] - fee
         trade_id = record_fill("SELL", sym, pos["qty"], px, fee, pos["position_id"],
-                               exit_reason="signal", pnl=round(pnl, 2),
+                               exit_reason=reason, pnl=round(pnl, 2),
                                pnl_pct=round(pnl / (pos["qty"] * pos["price"]), 4))
         ctx = build_context(sym, "SELL", px, pos["qty"], None, regime)
         with db() as conn:
             log_decision(conn, ctx, (None, None, None), True, True, trade_id)
-        print(f"[bot] SELL {sym} x{pos['qty']} @ {px:.2f} (pnl {pnl:+.2f})")
+        print(f"[bot] SELL {sym} x{pos['qty']} @ {px:.2f} ({reason}, pnl {pnl:+.2f})")
 
     # buys: fill free top-N slots (equal weight of CURRENT equity)
     positions = open_positions()
