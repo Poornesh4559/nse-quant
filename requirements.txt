@@ -6,3 +6,4 @@ yfinance>=0.2.40
 vaderSentiment>=3.3.2
 fyers-apiv3>=3.1.16
 pyotp>=2.9
+fastmcp==3.4.6
