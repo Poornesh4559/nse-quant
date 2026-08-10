@@ -213,6 +213,11 @@ def cmd_execute() -> int:
                 continue
             qty = int(per // px)
             if qty <= 0:
+                ctx = build_context(p["symbol"], "SKIP", px, 0, p, regime)
+                with db() as conn:
+                    log_decision(conn, ctx, (None, "price too high for per-position budget", "budget"),
+                                 False, False)
+                print(f"[bot] SKIP {p['symbol']} — ₹{px:,.0f}/share exceeds the ₹{per:,.0f} budget slot")
                 continue
             notional = qty * px
             fee = FEES.entry_fee(notional)
