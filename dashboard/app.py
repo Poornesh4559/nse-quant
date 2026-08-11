@@ -17,7 +17,7 @@ import logging
 import math
 import os
 from contextlib import contextmanager
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta, time as dtime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 from zoneinfo import ZoneInfo
@@ -27,7 +27,7 @@ import pandas as pd
 import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -582,6 +582,55 @@ def movers(n: int = Query(10, ge=1, le=100, description="How many gainers/losers
 def index() -> FileResponse:
     """Serve the dashboard frontend entry point."""
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.post("/api/ingest/reddit")
+async def ingest_reddit(request: Request) -> dict[str, Any]:
+    """Ingest endpoint for the HOME-SERVER reddit scraper (live subreddit feed).
+
+    The home LXC (home IP — not reddit-blocked) scrapes subreddit JSON and
+    POSTs here. Bearer token protects the write. Posts are mapped to symbols,
+    dual-model scored (VADER+FinBERT) and deduped by permalink — the same
+    pipeline quality as every other news source.
+
+    Body: {"posts": [{"title", "permalink", "created_utc", "subreddit", "selftext"}]}
+    """
+    token = (request.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
+    if not token or token != os.getenv("REDDIT_INGEST_TOKEN", ""):
+        raise HTTPException(status_code=401, detail="invalid ingest token")
+    body = await request.json()
+    posts = body.get("posts") or []
+    if not posts:
+        return {"stored": 0, "posts": 0}
+
+    # lazy import so the dashboard doesn't pay torch/FinBERT at startup
+    from collector.news import mapper, scorer, store as news_store
+
+    rows: list[dict] = []
+    for p in posts:
+        try:
+            title = str(p.get("title") or "")[:500]
+            selftext = str(p.get("selftext") or "")[:400]
+            text = (title + " " + selftext).strip()
+            if not text:
+                continue
+            symbols = mapper.map_symbols(text)
+            score = scorer.score_text(text)
+            rows.append({
+                "source": f"reddit_live:{p.get('subreddit') or '?'}",
+                "symbol": symbols[0] if symbols else None,
+                "title": title,
+                "url": f"https://www.reddit.com{p.get('permalink') or ''}",
+                "published_at": datetime.fromtimestamp(int(p.get("created_utc", 0)), tz=timezone.utc)
+                                if p.get("created_utc") else None,
+                "sentiment_compound": score.get("compound"),
+                "sentiment_label": score.get("label"),
+            })
+        except Exception:  # noqa: BLE001
+            logger.exception("ingest failed for reddit post %r", p.get("title"))
+    stored = news_store.upsert_news(rows) if rows else 0
+    logger.info("reddit ingest: %d posts -> %d stored", len(posts), stored)
+    return {"posts": len(posts), "stored": stored}
 
 
 # Everything under /static/ (plus the API routes registered above, which take
