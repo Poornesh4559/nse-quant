@@ -49,6 +49,20 @@ def upsert_news(rows: Sequence[dict]) -> int:
     """
     if not rows:
         return 0
+    # In-memory dedupe by url, falling back to title: the DB unique index on
+    # url ignores NULLs, so NULL-url stories (common from some feeds) were
+    # re-inserted on every run and polluted the sentiment aggregates.
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for r in rows:
+        key = r.get("url") or r.get("title") or ""
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(r)
+    if len(unique) < len(rows):
+        logger.info("dropped %d duplicate rows before upsert", len(rows) - len(unique))
+    rows = unique
     _ensure_unique_index()
 
     now = datetime.now(timezone.utc)

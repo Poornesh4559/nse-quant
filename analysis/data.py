@@ -51,6 +51,23 @@ def _ist_date(ts: pd.Series) -> pd.Series:
     )
 
 
+def _ist_trade_date(ts: pd.Series) -> pd.Series:
+    """IST calendar date with POST-CLOSE news pushed to the next calendar day.
+
+    NSE closes at 15:30 IST. An article published at 18:00 on trading day t
+    cannot have influenced the close of t, so it must only be "known" from
+    t+1 onward. Bucketing it to t+1 (a calendar day) is safe: the panel's
+    as-of ffill then carries it to the next TRADING date, never backward.
+    Without this cutoff, up to 8.5h of same-day post-close information leaked
+    into sent_1d/3d which predict t -> t+1.
+    """
+    tz = "Asia/Kolkata"
+    local = pd.to_datetime(ts, utc=True).dt.tz_convert(tz)
+    base = local.dt.normalize().dt.tz_localize(None)
+    after_close = (local.dt.hour > 15) | ((local.dt.hour == 15) & (local.dt.minute >= 30))
+    return base + pd.to_timedelta(after_close.astype(int), unit="D")
+
+
 def load_daily(symbols: Sequence[str] | None = None) -> dict[str, pd.DataFrame]:
     """Load daily OHLCV candles for the given symbols (or all with 1d data).
 
@@ -128,7 +145,9 @@ def load_sentiment() -> pd.DataFrame:
         return _SENTIMENT_CACHE
 
     df = pd.DataFrame(rows)
-    df["date"] = _ist_date(df["published_at"])
+    # post-close (>= 15:30 IST) news is bucketed to the NEXT day so features
+    # at the close of t never see articles published after the close of t
+    df["date"] = _ist_trade_date(df["published_at"])
     grouped = (
         df.groupby(["symbol", "date"])["sentiment_compound"]
         .mean()

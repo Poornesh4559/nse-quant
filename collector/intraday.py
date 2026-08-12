@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from collector.db import list_symbols, latest_candle_ts, upsert_candles
 from collector.fyers_client import FyersClient
 from collector.symbols import fyers_symbol
 
 logger = logging.getLogger(__name__)
+
+IST = ZoneInfo("Asia/Kolkata")
 
 WINDOW_HOURS = 3  # how far back each poll reaches to close gaps
 
@@ -24,7 +27,7 @@ def collect_intraday(client: FyersClient, timeframes: list[str] | None = None) -
     timeframes = timeframes or ["5m", "15m"]
     symbols = list_symbols()
     total = 0
-    now = datetime.now().astimezone()
+    now = datetime.now(IST)  # pinned to IST: host TZ must not shift the window
 
     for tf in timeframes:
         for sym in symbols:

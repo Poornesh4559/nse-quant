@@ -23,6 +23,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import requests
 import xml.etree.ElementTree as ET
@@ -55,12 +56,14 @@ def _parse_datetime(value: Any) -> datetime | None:
     try:
         parsed = email.utils.parsedate_to_datetime(text)
         if parsed is not None:
-            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            # tz-less timestamps from INDIAN feeds are IST, not UTC — treating
+            # them as UTC shifted evening articles to the wrong trading day
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
     except (TypeError, ValueError):
         pass
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
         try:
-            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+            return datetime.strptime(text, fmt).replace(tzinfo=ZoneInfo("Asia/Kolkata"))
         except ValueError:
             continue
     return None

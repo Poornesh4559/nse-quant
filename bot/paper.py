@@ -18,13 +18,14 @@ import argparse
 import json
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import timedelta
 from pathlib import Path
 
 import psycopg2
 
 from analysis.engine import FeeSchedule
 from bot.llm_gate import LLM_MIN_RATING, build_context, llm_rate, log_decision
+from analysis.calendar import is_trading_day, ist_today
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PICKS_PATH = REPO_ROOT / "data" / "signals" / "nextday_picks.json"
@@ -75,13 +76,18 @@ def market_regime() -> dict:
 
     Asia component: average % move of Nikkei/HSI/Shanghai/STI (they open
     BEFORE India), clipped to ±2% and scaled to [-1, 1] (/2).
+
+    Freshness: missing OR stale rows (pipeline stalled > 4 days ago — a
+    weekend + a holiday) force risk-OFF. Previously empty tables scored 0 and
+    "passed" the gate, so a dead cues job silently flipped the regime to
+    risk-ON with no data behind it.
     """
     with db() as conn, conn.cursor() as cur:
-        cur.execute("SELECT avg_compound FROM market_sentiment ORDER BY date DESC LIMIT 1")
-        ms = cur.fetchone()
-        cur.execute("SELECT avg_compound, themes FROM global_cues ORDER BY date DESC LIMIT 1")
+        cur.execute("SELECT avg_compound, date FROM market_sentiment ORDER BY date DESC LIMIT 1")
+        ms_row = cur.fetchone()
+        cur.execute("SELECT avg_compound, themes, date FROM global_cues ORDER BY date DESC LIMIT 1")
         gc_row = cur.fetchone()
-    ms = ms[0] if ms else 0.0
+    ms = ms_row[0] if ms_row else 0.0
     gc = gc_row[0] if gc_row else 0.0
     asia_avg = 0.0
     if gc_row and gc_row[1]:
@@ -94,26 +100,52 @@ def market_regime() -> dict:
             asia_avg = 0.0
     asia_score = max(-1.0, min(1.0, asia_avg / 2.0))  # ±2% -> ±1
     score = REGIME_W_MARKET * (ms or 0.0) + REGIME_W_CUES * (gc or 0.0) + REGIME_W_ASIA * asia_score
+    today = ist_today()
+    stale = False
+    for label, d in (("market_sentiment", ms_row[1] if ms_row else None),
+                     ("global_cues", gc_row[2] if gc_row else None)):
+        if d is None or d < today - timedelta(days=4):
+            stale = True
+            print(f"[bot] regime input {label} is stale (latest {d}) — forcing risk-off")
     return {"score": score, "market": ms, "cues": gc, "asia": round(asia_avg, 2),
-            "risk_on": score > REGIME_OFF}
+            "risk_on": (score > REGIME_OFF) and not stale, "stale": stale}
 
 
 def open_positions() -> list[dict]:
-    """Rows from trades: latest fill per position_id; open = BUY without exit."""
+    """Open positions from trades: net of BUY/SELL fills per position_id.
+
+    A position is open when its net quantity is > 0. Aggregating (rather than
+    the old row-count heuristic) survives averaging entries and partial
+    exits — the old code marked a position "closed" on ANY second fill, and a
+    SELL row without its BUY row became a phantom open position that got sold
+    again. Entry price = volume-weighted average of the BUY fills; fees = sum
+    of entry fees (both match what a single-fill position used to record).
+    """
     with db() as conn, conn.cursor() as cur:
         cur.execute("""
-            SELECT position_id, symbol, side, qty, price, ts, strategy, fees
-            FROM trades WHERE status='paper' ORDER BY ts
+            SELECT position_id, symbol,
+                   SUM(CASE WHEN side='BUY' THEN qty ELSE 0 END) AS bought_qty,
+                   SUM(CASE WHEN side='BUY' THEN qty*price END) AS buy_notional,
+                   SUM(CASE WHEN side='BUY' THEN fees ELSE 0 END) AS buy_fees,
+                   SUM(CASE WHEN side='BUY' THEN qty ELSE -qty END) AS net_qty,
+                   MAX(ts) AS last_ts
+            FROM trades WHERE status='paper'
+            GROUP BY position_id, symbol
         """)
         rows = cur.fetchall()
-    by_pos: dict[str, dict] = {}
-    for pid, symbol, side, qty, price, ts, strategy, fees in rows:
-        if pid not in by_pos:
-            by_pos[pid] = {"position_id": pid, "symbol": symbol, "side": side,
-                           "qty": qty, "price": price, "ts": ts, "fees": fees or 0.0}
-        else:
-            by_pos[pid]["closed"] = True  # an exit fill exists
-    return [p for p in by_pos.values() if not p.get("closed")]
+    out: list[dict] = []
+    for pid, symbol, bought_qty, buy_notional, buy_fees, net_qty, last_ts in rows:
+        net_qty = net_qty or 0
+        if net_qty <= 0:
+            continue
+        bought_qty = bought_qty or 0
+        price = (buy_notional or 0.0) / bought_qty if bought_qty else 0.0
+        out.append({
+            "position_id": pid, "symbol": symbol, "side": "BUY",
+            "qty": int(net_qty), "price": float(price), "ts": last_ts,
+            "fees": float(buy_fees or 0.0),
+        })
+    return out
 
 
 def live_prices(symbols: list[str]) -> tuple[dict[str, float], bool]:
@@ -123,13 +155,26 @@ def live_prices(symbols: list[str]) -> tuple[dict[str, float], bool]:
     try:
         from collector.fyers_client import FyersClient
         client = FyersClient()
-        fyers_symbols = [f"NSE:{s}-EQ" if s not in ("NIFTY 50", "BANKNIFTY") else f"NSE:{s.replace(' ','')}-INDEX" for s in symbols]
+        # Map DB tickers -> Fyers symbols (BANKNIFTY is NSE:NIFTYBANK-INDEX,
+        # NOT NSE:BANKNIFTY-INDEX), and keep a reverse map so quote keys map
+        # back to the DB tickers the rest of the bot uses.
+        fyers_symbols, db_by_fyers = [], {}
+        for s in symbols:
+            if s == "BANKNIFTY":
+                fy = "NSE:NIFTYBANK-INDEX"
+            elif s == "NIFTY 50":
+                fy = "NSE:NIFTY50-INDEX"
+            else:
+                fy = f"NSE:{s}-EQ"
+            fyers_symbols.append(fy)
+            db_by_fyers[fy] = s
         quotes = client.quotes(fyers_symbols)
         for sym, v in quotes.items():
             ltp = v.get("lp")
             if ltp:
-                bare = sym.split(":")[-1].replace("-EQ", "").replace("-INDEX", "")
-                prices[bare] = float(ltp)
+                db_sym = db_by_fyers.get(sym)
+                if db_sym:
+                    prices[db_sym] = float(ltp)
     except Exception as e:  # noqa: BLE001
         print(f"[bot] Fyers quote unavailable ({e}) — using last DB close")
         fallback = True
@@ -231,9 +276,39 @@ def record_fill(side: str, symbol: str, qty: int, price: float, fees: float,
     return trade_id
 
 
+# Arbitrary fixed advisory-lock key for cmd_execute: prevents two overlapping
+# runs (cron + manual rerun) from double-buying the same slots.
+EXECUTE_LOCK_KEY = 0x6E5E5155
+
+
 def cmd_execute() -> int:
+    """Single-flight wrapper around _execute_locked.
+
+    An advisory lock (Postgres session lock) ensures only one execute runs at
+    a time. Two overlapping runs used to both see zero open positions and
+    fill the same top-5 slots -> 2x exposure and 2x fees.
+    """
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT pg_try_advisory_lock(%s)", (EXECUTE_LOCK_KEY,))
+        if not (cur.fetchone() or (False,))[0]:
+            print("[bot] another execute run holds the lock — skipping this invocation")
+            return 0
+        try:
+            rc = _execute_locked()
+        finally:
+            cur.execute("SELECT pg_advisory_unlock(%s)", (EXECUTE_LOCK_KEY,))
+            conn.commit()
+    return rc
+
+
+def _execute_locked() -> int:
     picks = load_picks()
-    today = datetime.now(timezone.utc).date()
+    today = ist_today()
+    # never "trade" on a weekend or NSE holiday (would use stale closes)
+    if not is_trading_day(today):
+        print(f"[bot] {today} is not an NSE trading day — skipping")
+        return 0
     if picks.get("next_trade_date") != str(today):
         print(f"[bot] signals target {picks.get('next_trade_date')}, today {today} — "
               "skipping (not a signal day)")
@@ -272,10 +347,10 @@ def cmd_execute() -> int:
         px = prices.get(sym, pos["price"])
         reason, hold_text = decide_exit(pos, px, rank_pos)
         if not reason:
-            # HOLD — still logged to the training set with why
+            # HOLD — still logged to the training set with why (never LLM-gated)
             ctx = build_context(sym, "HOLD", px, pos["qty"], None, regime)
             with db() as conn:
-                log_decision(conn, ctx, (None, hold_text, "rules"), True, False)
+                log_decision(conn, ctx, (None, hold_text, "rules"), None, False)
             print(f"[bot] HOLD {sym} ({hold_text})")
             continue
         notional = pos["qty"] * px
@@ -286,7 +361,7 @@ def cmd_execute() -> int:
                                pnl_pct=round(pnl / (pos["qty"] * pos["price"]), 4))
         ctx = build_context(sym, "SELL", px, pos["qty"], None, regime)
         with db() as conn:
-            log_decision(conn, ctx, (None, None, None), True, True, trade_id)
+            log_decision(conn, ctx, (None, None, None), None, True, trade_id)
         print(f"[bot] SELL {sym} x{pos['qty']} @ {px:.2f} ({reason}, pnl {pnl:+.2f})")
 
     # buys: fill free top-N slots (equal weight of CURRENT equity)
@@ -310,7 +385,7 @@ def cmd_execute() -> int:
                 ctx = build_context(p["symbol"], "SKIP", px, 0, p, regime)
                 with db() as conn:
                     log_decision(conn, ctx, (None, "price too high for per-position budget", "budget"),
-                                 False, False)
+                                 None, False)
                 print(f"[bot] SKIP {p['symbol']} — ₹{px:,.0f}/share exceeds the ₹{per:,.0f} budget slot")
                 continue
             notional = qty * px
@@ -320,7 +395,15 @@ def cmd_execute() -> int:
                 dec_id = log_decision(conn, ctx, (None, None, None), False, False)
             # ---- LLM final rating gate ----
             rating, reason, model = llm_rate(ctx)
-            gate_pass = rating is not None and rating >= LLM_MIN_RATING
+            # Fail OPEN when the LLM is unavailable (rating is None): the gate
+            # must only block on an actual low rating. A dead CLI/timeout used
+            # to silently freeze ALL buys while the docstring promised
+            # fail-open — the gap stays visible in the log via llm_model.
+            if rating is None:
+                gate_pass = True
+                print(f"[bot] LLM gate unavailable ({model}) — failing open on composite")
+            else:
+                gate_pass = rating >= LLM_MIN_RATING
             with db() as conn:
                 cur = conn.cursor()
                 cur.execute("""UPDATE trade_decisions SET llm_rating=%s, llm_reason=%s,
@@ -345,12 +428,17 @@ def cmd_execute() -> int:
     return 0
 
 
-def _portfolio_equity() -> float:
-    """Cash + mark-to-market of open positions (approximation at execution)."""
+def _cash_balance() -> float:
+    """Cash on hand: CAPITAL + realized cashflows of every paper fill."""
     with db() as conn, conn.cursor() as cur:
         cur.execute("SELECT COALESCE(SUM(CASE WHEN side='BUY' THEN -(qty*price+fees) "
                     "ELSE qty*price-fees END),0) FROM trades WHERE status='paper'")
-        cash = CAPITAL + float(cur.fetchone()[0])
+        return CAPITAL + float((cur.fetchone() or (0.0,))[0])
+
+
+def _portfolio_equity() -> float:
+    """Cash + mark-to-market of open positions (approximation at execution)."""
+    cash = _cash_balance()
     equity = cash
     for pos in open_positions():
         equity += pos["qty"] * _last_close(pos["symbol"])
@@ -359,7 +447,7 @@ def _portfolio_equity() -> float:
 
 def cmd_eod() -> int:
     """Stop-loss check + daily equity snapshot vs NIFTY 50 benchmark."""
-    today = datetime.now(timezone.utc).date()
+    today = ist_today()
     positions = open_positions()
     for pos in positions:
         close = _last_close(pos["symbol"])
@@ -387,7 +475,7 @@ def cmd_eod() -> int:
                            VALUES (%s, %s, %s, %s, %s)
                            ON CONFLICT (date) DO UPDATE SET equity=EXCLUDED.equity,
                              cash=EXCLUDED.cash, benchmark=EXCLUDED.benchmark, created_at=now()""",
-                        (today, round(equity, 2), round(CAPITAL + equity - equity, 2), round(bench, 2), STRATEGY))
+                        (today, round(equity, 2), round(_cash_balance(), 2), round(bench, 2), STRATEGY))
             conn.commit()
             print(f"[bot] EOD {today}: equity ₹{equity:,.2f} vs benchmark ₹{bench:,.2f} "
                   f"({(equity/bench - 1) * 100:+.2f}%)")

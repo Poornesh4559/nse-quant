@@ -375,19 +375,25 @@ def portfolio() -> dict[str, Any]:
             row = cur.fetchone()
             trade_count = int(row["n"]) if row else 0
             cur.execute(
-                "SELECT symbol, sum(qty) AS qty, sum(qty * price) AS invested "
+                "SELECT symbol, "
+                "  sum(CASE WHEN side='BUY' THEN qty ELSE -qty END) AS net_qty, "
+                "  sum(CASE WHEN side='BUY' THEN qty*price ELSE 0 END) AS buy_cost, "
+                "  sum(CASE WHEN side='BUY' THEN qty ELSE 0 END) AS bought_qty "
                 "FROM trades GROUP BY symbol ORDER BY symbol"
             )
             pos_rows = [dict(r) for r in cur.fetchall()]
 
-    positions = [
-        {
-            "symbol": r["symbol"],
-            "qty": int(r["qty"] or 0),
-            "invested": round(float(r["invested"] or 0.0), 2),
-        }
-        for r in pos_rows
-    ]
+    positions = []
+    for r in pos_rows:
+        net = int(r["net_qty"] or 0)
+        bought = int(r["bought_qty"] or 0)
+        if net == 0:
+            continue  # fully round-tripped: no open position remains
+        # invested = average entry price x remaining qty. The old sum over ALL
+        # sides counted buys AND sells, so a closed round-trip showed ~2x
+        # "invested".
+        invested = (float(r["buy_cost"] or 0.0) * net / bought) if bought else 0.0
+        positions.append({"symbol": r["symbol"], "qty": net, "invested": round(invested, 2)})
     total_invested = round(float(sum(p["invested"] for p in positions)), 2)
     summary = {
         "open_positions": len(positions),
@@ -596,7 +602,11 @@ async def ingest_reddit(request: Request) -> dict[str, Any]:
     Body: {"posts": [{"title", "permalink", "created_utc", "subreddit", "selftext"}]}
     """
     token = (request.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
-    if not token or token != os.getenv("REDDIT_INGEST_TOKEN", ""):
+    expected = os.getenv("REDDIT_INGEST_TOKEN", "")
+    # Fail CLOSED when the env var is unset: an empty expected value used to
+    # match an empty token, so a misconfigured VPS silently exposed a public
+    # write endpoint that feeds the bot's sentiment features.
+    if not expected or token != expected:
         raise HTTPException(status_code=401, detail="invalid ingest token")
     body = await request.json()
     posts = body.get("posts") or []

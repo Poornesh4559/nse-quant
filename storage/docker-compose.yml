@@ -9,6 +9,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-nse}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
       POSTGRES_DB: ${POSTGRES_DB:-nse_quant}
+      TZ: Asia/Kolkata   # keep now()::date math consistent with the NSE day
     volumes:
       - timescale-data:/var/lib/postgresql/data
       - ./init:/docker-entrypoint-initdb.d:ro   # schema applied on first boot

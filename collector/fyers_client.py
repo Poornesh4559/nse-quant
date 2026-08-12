@@ -17,6 +17,7 @@ import logging
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Sequence
+from zoneinfo import ZoneInfo
 
 from fyers_apiv3 import fyersModel
 
@@ -221,8 +222,10 @@ class FyersClient:
         for row in resp.get("candles", []):
             # Fyers returns [epoch, open, high, low, close, volume]
             candles[row[0]] = {
+                # Pin to IST regardless of host TZ: a UTC host previously
+                # produced midnight-local candles that shifted trading dates.
                 "ts": datetime.fromtimestamp(row[0], tz=timezone.utc).astimezone(
-                    datetime.now().astimezone().tzinfo
+                    ZoneInfo("Asia/Kolkata")
                 ),
                 "open": row[1],
                 "high": row[2],
@@ -246,7 +249,7 @@ class FyersClient:
 
     def is_market_open(self) -> bool:
         """Rough India market-hours check (NSE: Mon–Fri 09:15–15:30 IST)."""
-        now = datetime.now().astimezone()  # VPS is Asia/Kolkata
+        now = datetime.now(ZoneInfo("Asia/Kolkata"))  # host TZ must not matter
         if now.weekday() >= 5:
             return False
         t = now.time()

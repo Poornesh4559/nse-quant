@@ -25,6 +25,7 @@ import pandas as pd
 
 from analysis.ml.panel import build_panel
 from analysis.ml.train import FEATURES_PATH, MODEL_PATH
+from analysis.calendar import next_trading_day
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SIGNALS_DIR = REPO_ROOT / "data" / "signals"
@@ -89,8 +90,11 @@ def predict_next(today: str | dt.date | None = None,
     nxt = next((d for d in calendar if d > last_date), None)
     nxt_estimated = False
     if nxt is None:
-        # market calendar not in the DB yet (weekend/holiday) — estimate next weekday
-        nxt = pd.bdate_range(last_date + pd.Timedelta(days=1), periods=1)[0]
+        # market calendar not in the DB yet (weekend/holiday) — estimate the
+        # next NSE TRADING day (weekday minus holidays). The old bdate_range
+        # fallback could land on an NSE holiday, so the bot would execute at
+        # stale closes or skip the real next trading day.
+        nxt = pd.Timestamp(next_trading_day(last_date.date()))
         nxt_estimated = True
 
     result = {

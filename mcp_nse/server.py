@@ -108,7 +108,15 @@ def get_candles(symbol: str, timeframe: str = "1d", limit: int = 100) -> dict:
 
 @mcp.tool()
 def get_indicators(symbol: str, timeframe: str = "1d", limit: int = 50) -> dict:
-    """Latest technical indicators: SMA20/50, EMA12/26, RSI14, MACD, Bollinger."""
+    """Latest technical indicators: SMA20/50, EMA12/26, RSI14, MACD, Bollinger.
+
+    Note: indicators are computed on DAILY data only — the timeframe argument
+    is accepted for API compatibility but anything other than '1d' is
+    rejected (it was previously silently ignored).
+    """
+    if timeframe != "1d":
+        return {"symbol": symbol,
+                "error": f"indicators are computed on daily data only (got timeframe={timeframe!r}); use '1d'"}
     from analysis.data import load_daily
     from analysis.features import compute_features
     frames = load_daily()

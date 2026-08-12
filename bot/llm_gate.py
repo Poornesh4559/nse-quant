@@ -130,9 +130,14 @@ def llm_rate(ctx: dict) -> tuple[float | None, str | None, str | None]:
         return None, None, "unparseable"
 
 
-def log_decision(db_conn, ctx: dict, llm: tuple, gate_pass: bool,
+def log_decision(db_conn, ctx: dict, llm: tuple, gate_pass: bool | None,
                  executed: bool, trade_id: int | None = None) -> int:
-    """Insert/update a trade_decisions row. Returns the row id."""
+    """Insert/update a trade_decisions row. Returns the row id.
+
+    ``gate_pass`` is None for actions that were never LLM-gated (HOLD/SELL/
+    SKIP) — only BUY decisions carry a real True/False, so the training set
+    can't learn "holds passed the gate".
+    """
     rating, reason, model = llm
     with db_conn.cursor() as cur:
         cur.execute("""
