@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import time
 from typing import Any
 from urllib import parse
 
@@ -187,8 +188,13 @@ def _login_once() -> str:
     return token["access_token"]
 
 
-def headless_login(retries: int = 3) -> str:
-    """Run the full login flow with retries for transient failures."""
+def headless_login(retries: int = 6, pause: float = 2.5) -> str:
+    """Run the full login flow with retries for transient failures.
+
+    Fyers' /validate-authcode intermittently rejects the first 1-2 attempts
+    (HTTP 400 \"invalid auth code\") even when everything is correct — observed
+    at least once a day. Retry with a short pause; 6 attempts covers it.
+    """
     last_err: Exception | None = None
     for attempt in range(retries):
         try:
@@ -198,4 +204,6 @@ def headless_login(retries: int = 3) -> str:
         except (KeyError, RuntimeError) as exc:
             last_err = exc
             logger.warning("login attempt %d failed: %s", attempt + 1, exc)
+            if attempt < retries - 1:
+                time.sleep(pause)
     raise last_err  # type: ignore[misc]
