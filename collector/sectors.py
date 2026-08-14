@@ -18,7 +18,7 @@ SECTORS: dict[str, str] = {
     "TCS": "IT", "INFY": "IT", "HCLTECH": "IT", "TECHM": "IT", "WIPRO": "IT",
     # Automobile
     "MARUTI": "AUTO", "M&M": "AUTO", "HEROMOTOCO": "AUTO", "BAJAJ-AUTO": "AUTO",
-    "TATAMOTORS": "AUTO", "EICHERMOT": "AUTO",
+    "TMPV": "AUTO", "EICHERMOT": "AUTO",
     # Banking
     "HDFCBANK": "BANK", "ICICIBANK": "BANK", "SBIN": "BANK", "KOTAKBANK": "BANK",
     "AXISBANK": "BANK", "INDUSINDBK": "BANK",
