@@ -25,7 +25,7 @@ import pandas as pd
 
 from analysis.ml.panel import build_panel
 from analysis.ml.train import FEATURES_PATH, MODEL_PATH
-from analysis.calendar import next_trading_day
+from analysis.calendar import is_trading_day, next_trading_day
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SIGNALS_DIR = REPO_ROOT / "data" / "signals"
@@ -37,6 +37,18 @@ TOP_N = 5
 MOM_W = 0.40   # cross-sectional momentum percentile
 ML_W = 0.35    # ML next-day probability
 SENT_W = 0.25  # sentiment (sent_3d, clipped [-1,1] -> [0,1])
+
+
+def ensure_fresh_daily_data(latest_date: dt.date, as_of: dt.date) -> None:
+    """Reject live signals when candles don't include the latest NSE session."""
+    expected = as_of
+    while not is_trading_day(expected):
+        expected -= dt.timedelta(days=1)
+    if latest_date != expected:
+        raise RuntimeError(
+            f"daily candles stale: latest {latest_date}, expected latest NSE session {expected}; "
+            "refresh EOD data before scoring"
+        )
 
 
 def composite(row) -> float:
@@ -51,6 +63,8 @@ def predict_next(today: str | dt.date | None = None,
                  model_path: Path = MODEL_PATH,
                  features_path: Path = FEATURES_PATH,
                  top_n: int = TOP_N) -> dict:
+    """Build a fresh panel and rank candidate equities."""
+    require_fresh = today is None
     today = pd.Timestamp(today or dt.date.today()).normalize()
 
     model = joblib.load(model_path)
@@ -65,6 +79,8 @@ def predict_next(today: str | dt.date | None = None,
     if not valid.any():
         raise RuntimeError("no rows with complete features in the panel — check data freshness")
     last_date = meta.loc[valid, "date"].max()
+    if require_fresh:
+        ensure_fresh_daily_data(last_date.date(), dt.date.fromisoformat(str(today)[:10]))
     sel = valid & (meta["date"] == last_date)
 
     # the paper bot trades equities only — drop INDEX instruments from the rank

@@ -12,6 +12,8 @@ Run from repo root:  .venv/bin/python -m pytest analysis/ml/test_ml.py -v
 """
 from __future__ import annotations
 
+from datetime import date
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -20,6 +22,16 @@ from analysis.ml.panel import build_panel
 from analysis.engine import FeeSchedule
 from analysis.ml.portfolio import PortfolioConfig, simulate_portfolio
 from analysis.ml.train import walk_forward_splits
+from analysis.ml.score import ensure_fresh_daily_data
+
+
+def test_freshness_guard_rejects_old_signals():
+    with pytest.raises(RuntimeError, match="daily candles stale"):
+        ensure_fresh_daily_data(date(2026, 10, 16), date(2026, 10, 28))
+
+
+def test_freshness_guard_accepts_last_session_before_weekend():
+    ensure_fresh_daily_data(date(2026, 10, 23), date(2026, 10, 25))  # Fri -> Sun
 
 
 def make_frame(opens: list[float], closes: list[float],

@@ -20,6 +20,7 @@ from collector.eod import collect_eod
 from collector.fyers_client import FyersClient
 from collector.intraday import collect_intraday
 from collector.symbols import seed_symbols
+from analysis.calendar import is_trading_day, ist_today
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,6 +54,9 @@ def cmd_eod(_args) -> int:
     client = FyersClient()
     rows = collect_eod(client)
     logger.info("eod complete: %d rows", rows)
+    if is_trading_day(ist_today()) and rows == 0:
+        logger.error("EOD produced no candles on a trading day")
+        return 1
     return 0
 
 

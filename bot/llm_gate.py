@@ -4,7 +4,7 @@ Every trade the bot CONSIDERS gets logged to ``trade_decisions`` with the full
 context it saw (composite score, ML prob, sentiment, regime, technicals, price)
 — that table becomes the training set for the next model generation.
 
-Before executing, the bot optionally asks an LLM (deepseek-v4-flash via the
+Before executing, the bot optionally asks GPT-6-Luna (OpenCode Go via the
 opencode CLI) for a final 0..1 rating. If the rating >= LLM_MIN_RATING the
 trade passes; the rating + reason are stored with the decision. If the LLM is
 unavailable the gate fails OPEN (trades on the composite alone, logged as
@@ -27,7 +27,7 @@ from analysis.data import load_daily
 from analysis.engine import FeeSchedule
 from analysis.features import compute_features
 
-LLM_MODEL = "opencode-go/deepseek-v4-flash"
+LLM_MODEL = "opencode-go/gpt-6-luna"
 LLM_MIN_RATING = 0.6          # gate threshold (tweakable)
 LLM_TIMEOUT_S = 60
 LLM_ENABLED = True            # flip to False to bypass the gate entirely
